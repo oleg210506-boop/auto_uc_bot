@@ -1,0 +1,2 @@
+{% extends 'base.html' %}{% block content %}<h1>Сохраните резервные коды</h1><div class="warning">Эти коды показаны один раз. Сохраните их в менеджере паролей, не в общем чате. Каждый код заменяет 2FA только один раз.</div><pre>{% for code in codes %}{{ code }}
+{% endfor %}</pre><a class="button" href="/account">Коды сохранены</a>{% endblock %}
