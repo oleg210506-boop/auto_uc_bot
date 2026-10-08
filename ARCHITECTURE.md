@@ -13,6 +13,7 @@
 - `engine.py`: предметная логика; изменения под RLock и/или BEGIN IMMEDIATE.
 - `worker.py`: задачи, сканирование/опрос, outbox, Telegram, изменение лотов, обслуживание.
 - `web.py`: вход/права/CSRF, серверная панель и signed webhook.
+- `web_security.py`: нормализация внешнего origin, HMAC-токен входа, диагностика CSRF; не имеет доступа к поставщикам или базе.
 - `maintenance.py`: исключительно offline/startup restore, single-instance lock, принудительная сверка.
 - `templates/`, `static/`: адаптивная панель; никаких клиентских API-ключей.
 - `tests/`: изолированные базы, сетевые заглушки, запрет socket.create_connection.

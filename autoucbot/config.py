@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from .web_security import canonical_origin
 
 @dataclass(frozen=True)
 class Config:
@@ -15,19 +15,32 @@ class Config:
     secure_cookie: bool = True
     start_worker: bool = True
     gamecore_url: str = "https://api.gamecore-api.tech"
+    # Railway sends requests through its edge proxy. Outside Railway, only
+    # loopback peers are trusted by default; operators may set explicit CIDRs.
+    forwarded_allow_ips: str = "127.0.0.1,::1"
+
+    def __post_init__(self):
+        if self.public_url:
+            public = canonical_origin(self.public_url)
+            if not public.startswith("https://"):
+                raise ValueError("PUBLIC_URL должен быть HTTPS-адресом вашей панели без пути и параметров.")
+            object.__setattr__(self, "public_url", public)
 
     @classmethod
     def from_env(cls) -> "Config":
         secret = os.getenv("APP_SECRET", "")
         if len(secret) < 32:
             raise ValueError("APP_SECRET: задайте случайную строку длиной не менее 32 символов в Railway Variables.")
-        public = os.getenv("PUBLIC_URL", "").rstrip("/")
+        public = os.getenv("PUBLIC_URL", "").strip()
         if public:
-            u = urlsplit(public)
-            if u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment:
-                raise ValueError("PUBLIC_URL должен быть HTTPS-адресом вашей панели без пути и параметров.")
-            if u.path not in ("", "/"):
-                raise ValueError("PUBLIC_URL не должен содержать путь.")
+            try:
+                public = canonical_origin(public)
+                if not public.startswith("https://"):
+                    raise ValueError("HTTPS required")
+            except ValueError:
+                raise ValueError("PUBLIC_URL должен быть HTTPS-адресом вашей панели без пути и параметров.") from None
+        proxy_default = "*" if os.getenv("RAILWAY_ENVIRONMENT_ID") else "127.0.0.1,::1"
+        forwarded = os.getenv("FORWARDED_ALLOW_IPS", proxy_default).strip()
         data_dir=Path(os.getenv("DATA_DIR", "/data"))
         if os.getenv("RAILWAY_ENVIRONMENT_ID"):
             mount=os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
@@ -37,7 +50,8 @@ class Config:
                    os.getenv("ADMIN_USERNAME", "owner"), os.getenv("ADMIN_PASSWORD", ""), public,
                    os.getenv("ENABLE_LIVE_PURCHASES") == "true",
                    os.getenv("COOKIE_SECURE", "true") == "true",
-                   os.getenv("START_WORKER", "true") == "true")
+                   os.getenv("START_WORKER", "true") == "true",
+                   forwarded_allow_ips=forwarded)
 
 # kind, default, label, hint, min, max. All financial values here are RUB, not cents.
 FIELDS = {

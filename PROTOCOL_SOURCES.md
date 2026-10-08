@@ -37,3 +37,13 @@
 - https://core.telegram.org/bots/tutorial
 
 Тесты используют synthetic fixtures, часть числовых примеров из документации. Это НЕ коммерческий прайс и НЕ результат фактической выдачи.
+
+## Исправление CSRF / Railway 1.0.1-rc1
+
+- https://fastapi.tiangolo.com/advanced/behind-a-proxy/
+- https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Origin
+- https://starlette.dev/responses/
+- https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+
+Опубликованное поведение no-referrer может дать Origin:null в HTML POST.
+В локальном тесте это моделировалось явно; браузерный E2E в среде заблокирован.

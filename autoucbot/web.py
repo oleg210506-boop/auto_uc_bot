@@ -2,6 +2,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -16,14 +17,18 @@ from fastapi import FastAPI,Request
 from fastapi.responses import HTMLResponse,RedirectResponse,PlainTextResponse,FileResponse,JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from . import __version__
 from .config import Config,FIELDS,TEMPLATES,SECRET_ENV
 from .db import DB,dumps
 from .engine import Engine
 from .worker import Worker
 from .security import Vault,password_hash,verify_password,token_hash,new_totp_secret,verify_totp,provisioning_uri,webhook_valid
+from .web_security import (canonical_origin, source_error, login_csrf_error,
+                           login_csrf_for_page, csrf_equal)
 from .utils import BusinessError,money,cents,csv_safe,validate_template,positive_int,day_start
 
+LOG=logging.getLogger("uvicorn.error")
 ROOT=Path(__file__).parent
 STATE_NAMES={"awaiting_uid":"Ожидает UID","awaiting_confirmation":"Ожидает подтверждения","ready":"Готов к закупке","waiting_balance":"Ожидает баланса",
  "processing":"Выполняется","unknown":"Результат неизвестен","partial":"Частично выдан","failed":"Ошибка","completed":"Выдан","cancelled":"Отменён/закрыт","manual":"Нужен оператор","observed":"Наблюдение"}
@@ -65,55 +70,99 @@ def create_app(config=None):
         return o
     def task_notice(tid):return f"Действие #{tid} добавлено. Результат будет в таблице действий; обновите страницу."
 
+    def security_headers(response):
+        # no-referrer can cause Origin: null on HTML form POSTs. same-origin
+        # preserves the source of our own forms without leaking referrers to
+        # other sites. Apply headers to early failures and redirects as well.
+        response.headers.update({"X-Content-Type-Options":"nosniff","X-Frame-Options":"DENY",
+            "Referrer-Policy":"same-origin","Cache-Control":"no-store, private","Pragma":"no-cache",
+            "Content-Security-Policy":"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
+        if config.secure_cookie:response.headers["Strict-Transport-Security"]="max-age=31536000"
+        return response
+
+    def login_response(request, *, error="", error_code="", status_code=200):
+        token, remaining = login_csrf_for_page(request.cookies.get("auc_login_csrf", ""), config.secret)
+        response = page(request, "login.html", login_csrf=token, error=error,
+                        error_code=error_code, public_url=config.public_url)
+        response.status_code = status_code
+        response.set_cookie("auc_login_csrf", token, path="/", httponly=True,
+                            secure=config.secure_cookie, samesite="lax", max_age=remaining)
+        return security_headers(response)
+
+    def csrf_failure(request, code):
+        # Codes, never credentials / cookies / tokens / raw forwarded headers.
+        LOG.warning("autoUCbot CSRF rejected: code=%s path=%s", code, request.url.path[:100])
+        messages = {
+            "CSRF_COOKIE_MISSING": "Браузер не передал защитную cookie. Откройте панель по HTTPS в обычной вкладке и разрешите cookie для этого сайта. Затем войдите заново.",
+            "CSRF_COOKIE_INVALID": "Защитная cookie устарела или относится к другой версии панели. Форма обновлена; введите данные ещё раз.",
+            "CSRF_EXPIRED": "Истекло время действия формы входа. Форма обновлена; введите данные ещё раз.",
+            "CSRF_TOKEN_MISSING": "В запросе нет защитного поля формы. Используйте обновлённую форму входа.",
+            "CSRF_TOKEN_MISMATCH": "Форма была обновлена в другой вкладке или осталась от старой версии. Введите данные в этой обновлённой форме.",
+            "CSRF_ORIGIN": "Не удалось подтвердить адрес отправки формы. Откройте панель по адресу PUBLIC_URL в обычной вкладке, обновите страницу и повторите вход.",
+            "CSRF_REFERER": "Адрес исходной страницы не совпадает с PUBLIC_URL. Откройте основной адрес панели и повторите вход.",
+            "CSRF_CROSS_SITE": "Форма отправлена с другого сайта. Откройте основной адрес панели в отдельной вкладке.",
+        }
+        message = messages.get(code, "Обновите страницу панели и повторите действие.")
+        if request.url.path == "/login":
+            return login_response(request, error="Ошибка CSRF. " + message, error_code=code, status_code=403)
+        response = page(request,"error.html",title="Форма не подтверждена",
+                        error="Ошибка CSRF. Действие не выполнено. " + message + " Код: " + code)
+        response.status_code = 403
+        return security_headers(response)
+
     @app.middleware("http")
     async def security(request,call_next):
         path=request.url.path
         if request.headers.get("content-length","").isdigit() and int(request.headers["content-length"])>1_048_576:
-            return PlainTextResponse("Слишком большой запрос",413)
+            return security_headers(PlainTextResponse("Слишком большой запрос",413))
         request.state.user=None;request.state.csrf=""
         public=path in ("/login","/healthz","/webhooks/gamecore") or path.startswith("/static/")
         cookie=request.cookies.get("auc_session","")
         if cookie:
             row=db.one("SELECT u.*,s.csrf,s.token_hash FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>? AND u.active=1",(token_hash(cookie),time.time()))
             if row:request.state.user=row;request.state.csrf=row["csrf"]
-        if not public and not request.state.user:return redirect("/login")
+        if not public and not request.state.user:return security_headers(redirect("/login"))
         if request.method=="POST" and path!="/webhooks/gamecore":
             body=await request.body()
-            if len(body)>1_048_576:return PlainTextResponse("Слишком большой запрос",413)
-            if not request.headers.get("content-type","").startswith("application/x-www-form-urlencoded"):
-                return PlainTextResponse("Ожидается обычная HTML-форма",415)
+            if len(body)>1_048_576:return security_headers(PlainTextResponse("Слишком большой запрос",413))
+            if request.headers.get("content-type","").split(";",1)[0].strip().lower()!="application/x-www-form-urlencoded":
+                return security_headers(PlainTextResponse("Ожидается обычная HTML-форма",415))
             fields=parse_qs(body.decode("utf-8",errors="replace"),keep_blank_values=True)
             expected=request.cookies.get("auc_login_csrf","") if path=="/login" else request.state.csrf
-            supplied=fields.get("csrf",[""])[0]
-            if not expected or not secrets.compare_digest(expected,supplied):return PlainTextResponse("Ошибка CSRF. Обновите страницу и повторите.",403)
-            origin=request.headers.get("origin")
-            expected_origin=config.public_url or str(request.base_url).rstrip("/")
-            if origin and origin!=expected_origin:return PlainTextResponse("Неверный Origin",403)
+            supplied=fields.get("csrf",[""])
+            if path=="/login":
+                reason=login_csrf_error(expected,config.secret)
+                if reason:return csrf_failure(request,reason)
+            if len(supplied)!=1 or not supplied[0]:return csrf_failure(request,"CSRF_TOKEN_MISSING")
+            if not csrf_equal(expected,supplied[0]):return csrf_failure(request,"CSRF_TOKEN_MISMATCH")
+            # PUBLIC_URL wins over the proxy's internal HTTP URL. Do not add
+            # X-Forwarded-Host to the allowlist or permit arbitrary origins.
+            try:expected_origin=config.public_url or canonical_origin(str(request.base_url))
+            except ValueError:return csrf_failure(request,"CSRF_ORIGIN")
+            reason=source_error(request.headers,expected_origin)
+            if reason:return csrf_failure(request,reason)
         try:response=await call_next(request)
         except PermissionError as exc:response=page(request,"error.html",title="Нет доступа",error=str(exc));response.status_code=403
         except (BusinessError,ValueError,sqlite3.IntegrityError) as exc:
             error="Конфликт данных: метка, ID объявления или имя пользователя уже используются." if isinstance(exc,sqlite3.IntegrityError) else str(exc)
-            response=page(request,"error.html",title="Действие не выполнено",error=error);response.status_code=400
+            if path=="/login":
+                response=login_response(request,error=error,error_code="LOGIN_REJECTED",status_code=400)
+            else:
+                response=page(request,"error.html",title="Действие не выполнено",error=error);response.status_code=400
         except Exception as exc:
             db.audit("web","error",detail=type(exc).__name__)
             response=page(request,"error.html",title="Внутренняя ошибка",error="Действие не подтверждено. Проверьте журнал и состояние заказа; не повторяйте закупку вслепую.");response.status_code=500
-        response.headers.update({"X-Content-Type-Options":"nosniff","X-Frame-Options":"DENY","Referrer-Policy":"no-referrer","Cache-Control":"no-store",
-            "Content-Security-Policy":"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"})
-        if config.secure_cookie:response.headers["Strict-Transport-Security"]="max-age=31536000"
-        return response
+        return security_headers(response)
 
     @app.get("/healthz")
     async def health():
         beat=db.one("SELECT updated FROM runtime WHERE key='worker'")
         ok=not config.start_worker or bool(beat and time.time()-beat["updated"]<300)
-        return JSONResponse({"status":"ok" if ok else "starting_or_stalled"},status_code=200 if ok else 503)
+        return JSONResponse({"status":"ok" if ok else "starting_or_stalled", "version":__version__},status_code=200 if ok else 503)
 
     @app.get("/login",response_class=HTMLResponse)
     async def login_page(request:Request):
-        csrf=secrets.token_urlsafe(32)
-        r=page(request,"login.html",login_csrf=csrf,error="")
-        r.set_cookie("auc_login_csrf",csrf,httponly=True,secure=config.secure_cookie,samesite="strict",max_age=900)
-        return r
+        return login_response(request)
     @app.post("/login")
     async def login(request:Request):
         f=await request.form();name=str(f.get("username","")).strip();password=str(f.get("password",""));otp=str(f.get("otp","")).strip()
@@ -141,7 +190,7 @@ def create_app(config=None):
             c.execute("DELETE FROM login_attempts WHERE key=?",(key,))
             c.execute("INSERT INTO sessions VALUES(?,?,?,?,?)",(token_hash(token),u["id"],csrf,now+8*3600,now))
             db.audit(name,"login",conn=c)
-        r=redirect("/");r.set_cookie("auc_session",token,httponly=True,secure=config.secure_cookie,samesite="strict",max_age=8*3600);r.delete_cookie("auc_login_csrf");return r
+        r=redirect("/");r.set_cookie("auc_session",token,httponly=True,secure=config.secure_cookie,samesite="strict",max_age=8*3600);r.delete_cookie("auc_login_csrf",path="/",secure=config.secure_cookie,httponly=True,samesite="lax");return r
     @app.post("/logout")
     async def logout(request:Request):
         db.execute("DELETE FROM sessions WHERE token_hash=?",(request.state.user["token_hash"],))
@@ -517,4 +566,8 @@ def create_app(config=None):
                 for b in c.execute("SELECT id,payload FROM batches WHERE state='unknown'").fetchall():
                     if json.loads(b["payload"]).get("externalOrderId")==external:c.execute("UPDATE batches SET next_check=0 WHERE id=?",(b["id"],))
         return JSONResponse({"ok":True})
+    # Added last so proxy interpretation runs BEFORE security and routing,
+    # including when another ASGI launcher calls create_app directly.
+    trusted = [part.strip() for part in config.forwarded_allow_ips.split(",") if part.strip()]
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=trusted)
     return app

@@ -1,1 +1,36 @@
-<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Вход · autoUCbot</title><link rel="stylesheet" href="/static/app.css"></head><body><main class="loginpage"><div class="brand">autoUCbot<small>ЗАКРЫТАЯ ПАНЕЛЬ УПРАВЛЕНИЯ</small></div><div class="card"><h1>Вход в панель</h1><p class="muted">Индивидуальный доступ владельца или оператора.</p><form method="post" action="/login"><input type="hidden" name="csrf" value="{{ login_csrf }}"><label>Имя пользователя<input name="username" autocomplete="username" required maxlength="40"></label><label>Пароль<input type="password" name="password" autocomplete="current-password" required maxlength="128"></label><label>Код 2FA или резервный код<input name="otp" autocomplete="one-time-code" maxlength="30"></label><span class="hint">При первом входе оставьте код пустым. Затем включите 2FA в разделе «Мой доступ».</span><button class="primary">Войти</button></form></div></main></body></html>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="same-origin">
+  <title>Вход · autoUCbot</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<main class="loginpage">
+  <div class="brand">autoUCbot<small>ЗАКРЫТАЯ ПАНЕЛЬ УПРАВЛЕНИЯ</small></div>
+  <div class="card">
+    <h1>Вход в панель</h1>
+    <p class="muted">Индивидуальный доступ владельца или оператора.</p>
+    {% if error %}
+    <div class="errorbox break" role="alert">
+      <p>{{ error }}</p>
+      {% if error_code %}<p class="minitext">Код: <code>{{ error_code }}</code></p>{% endif %}
+      <p><a href="/login">Открыть свежую форму входа</a></p>
+      {% if public_url %}<p class="minitext">Основной адрес: <a href="{{ public_url }}/login">{{ public_url }}</a></p>{% endif %}
+    </div>
+    {% endif %}
+    <form method="post" action="/login">
+      <input type="hidden" name="csrf" value="{{ login_csrf }}">
+      <label>Имя пользователя<input name="username" autocomplete="username" required maxlength="40" autocapitalize="none" spellcheck="false"></label>
+      <label>Пароль<input type="password" name="password" autocomplete="current-password" required maxlength="128"></label>
+      <label>Код 2FA или резервный код<input name="otp" autocomplete="one-time-code" maxlength="30"></label>
+      <span class="hint">При первом входе оставьте код пустым. Затем включите 2FA в разделе «Мой доступ».</span>
+      <button class="primary" type="submit">Войти</button>
+    </form>
+  </div>
+  <p class="footer">autoUCbot {{ version }} · защищённый вход</p>
+</main>
+</body>
+</html>
