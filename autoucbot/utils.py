@@ -29,7 +29,7 @@ def validate_uid(uid):
     if not re.fullmatch(r"[0-9]{6,15}", uid): raise BusinessError("UID должен содержать от 6 до 15 цифр")
     return uid
 
-ALLOWED_VARS = {"order_id", "uc", "quantity", "uid", "code", "orders", "buyer"}
+ALLOWED_VARS = {"order_id", "uc", "quantity", "uid", "code", "orders", "buyer", "amount", "unit", "recipient", "nickname"}
 def validate_template(text):
     if not text or len(text) > 3000: raise BusinessError("Текст сообщения должен содержать 1–3000 символов")
     try:

@@ -47,7 +47,8 @@ def restore_backup(config: Config, filename: str) -> bool:
         # immutable is valid for complete backups; never use a live DB/WAL as the input.
         with contextlib.closing(sqlite3.connect(source.as_uri()+'?mode=ro&immutable=1',uri=True)) as src:
             if src.execute('PRAGMA integrity_check').fetchone()[0]!='ok':raise ValueError('Копия повреждена.')
-            if src.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()!=('1',):
+            schema = src.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if schema not in (('1',),('2',)):
                 raise ValueError('Версия базы не поддерживается этим выпуском.')
             check=src.execute("SELECT value FROM meta WHERE key='vault_check'").fetchone()
             if not check:raise ValueError('Копия не содержит контрольной записи шифрования.')
@@ -67,6 +68,8 @@ def restore_backup(config: Config, filename: str) -> bool:
                     dst.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,json.dumps(value,ensure_ascii=False)))
                 dst.execute('DELETE FROM sessions')
                 dst.execute("UPDATE batches SET state='unknown',next_check=0 WHERE state='sending'")
+                if schema == ('2',):
+                    dst.execute("UPDATE fazer_parts SET state='unknown',next_check=0 WHERE state='sending'")
                 dst.execute("UPDATE outbox SET state=CASE WHEN state='sending' THEN 'uncertain' ELSE 'cancelled' END WHERE state IN('sending','pending')")
                 dst.execute("UPDATE tasks SET state='error',result='Восстановление базы: действие отменено' WHERE state IN('pending','running')")
                 dst.execute("UPDATE orders SET state='manual',confirmed=0,hold_reason='Восстановление: нужна сверка истории' WHERE state NOT IN('completed','cancelled','failed','partial') AND NOT EXISTS(SELECT 1 FROM batches b WHERE b.order_id=orders.id)")
@@ -74,9 +77,12 @@ def restore_backup(config: Config, filename: str) -> bool:
                 dst.commit();dst.execute('PRAGMA journal_mode=DELETE')
         current=root/'autoucbot.sqlite3'
         if current.exists():
-            old=DB(root);Vault(old,config.secret)
-            old.backup(20)
-            with contextlib.closing(old.connect()) as c:
+            target=root/'backups'/('before-restore-'+uuid.uuid4().hex+'.sqlite3')
+            target.parent.mkdir(exist_ok=True)
+            with contextlib.closing(sqlite3.connect(current)) as old, contextlib.closing(sqlite3.connect(target)) as bak:
+                old.backup(bak)
+            os.chmod(target,0o600)
+            with contextlib.closing(sqlite3.connect(current)) as c:
                 result=c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
                 if result and result[0]!=0:raise ValueError('База занята. Остановите другой процесс.')
         for suffix in ('-wal','-shm'):

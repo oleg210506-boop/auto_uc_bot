@@ -1,49 +1,28 @@
-# Контракты внешних сервисов
+# Первичные источники протокола — проверка 8 октября 2026
 
-Проверка опубликованных материалов при подготовке релиза: 08.10.2026. Собственный B2B-аккаунт, реальные деньги и live-сессия продавца не использовались. Документация поставщика — основание реализации, но не независимая проверка надёжности поставщика.
+- https://reseller.fazercards.com/en/docs — база api.fzr.cards/api/v2,
+  X-API-Key, /me, /balance (USD), /subscription/plans, /topups/offers,
+  /topups/order, /topups/validate-id, /telegram/stars, /telegram/stars/buy, /orders/:id.
+- https://reseller.fazercards.com/en/docs/cookbook — Idempotency-Key и срок 7 дней
+  для документированных purchase endpoints. Stars в этом списке не указан.
+- https://reseller.fazercards.com/en/docs/webhooks — подпись сырого тела
+  X-Webhook-Signature sha256=HMAC и события с data.order_id.
+- https://github.com/FZR-cards/fazercards-python — официальный SDK.
+- https://raw.githubusercontent.com/FZR-cards/fazercards-python/main/src/fazercards/client.py
+  — сверка точных тел и методов; buy_stars не принимает idempotency_key.
+- https://funpay.com/lots/2418/ — публичный раздел Telegram Stars типа lot.
+  ID объявления продавца и другие параметры берутся из его реальной формы.
+- https://docs.docker.com/compose/install/linux/ — установка Compose plugin.
+- https://caddyserver.com/docs/running — Docker и автоматический HTTPS.
+- https://docs.railway.com/variables — переменные сервиса.
 
-## GameCore — первичная документация
+Доступ к личному кабинету не выполнялся. Публичные JSON-цены и номера товаров в
+документации — примеры, не оферта и не прайс владельца. /subscription/plans в
+актуальной документации показывает пример Bronze $29, Silver $49, Gold $99 за
+30 дней; конкретную цену уточняет реальный ответ его аккаунта. Старое заявление
+про обязательные $9.99 не считается проверенным актуальным тарифом.
 
-- https://gamecore-api.tech/ru/docs/quickstart
-- https://gamecore-api.tech/ru/docs/authentication
-- https://gamecore-api.tech/ru/docs/catalog
-- https://gamecore-api.tech/ru/docs/orders
-- https://gamecore-api.tech/ru/docs/direct-top-up-api
-- https://gamecore-api.tech/ru/docs/webhooks
-- https://gamecore-api.tech/ru/docs/idempotency-and-errors
-- https://gamecore-api.tech/ru/pricing
-- https://gamecore-api.tech/ru/contact
-
-Реализовано: X-Api-Key, каталог PUBG id_only, товар, POST заказа с X-Idempotency-Key и externalOrderId, GET кода/списка заказов, все подзаказы, статусы позиций, подписанный webhook. Нет выдуманного GET /balance, отмены закупки, проверки nickname или бесплатного B2B sandbox.
-
-## FunPay — неофициальный протокол сайта
-
-Структуры сверялись с первичным исходным кодом актуального клиента, самостоятельно реализованы в адаптере этого проекта. Библиотека FunPayCardinal/FunPayAPI не включена в runtime и не выдаётся за официальный поддерживаемый API.
-
-- https://github.com/sidor0912/FunPayCardinal/blob/main/FunPayAPI/account.py
-- https://github.com/sidor0912/FunPayCardinal/blob/main/FunPayAPI/types.py
-- https://funpayapi.readthedocs.io/ru/latest/index.html
-
-Особенно важны: POST /api/orders/get; order type_data.amount; seller-authored summary/desc; chat_node runner; own offer form; /lots/raise game_id + выбранные node_ids. Формат может измениться — адаптер в таком случае должен безопасно остановить выдачу.
-
-## Railway и Telegram
-
-- https://docs.railway.com/pricing/plans
-- https://docs.railway.com/guides/volumes
-- https://docs.railway.com/networking/public-networking
-- https://docs.railway.com/deployments/serverless
-- https://docs.railway.com/networking/static-outbound-ips
-- https://core.telegram.org/bots/api
-- https://core.telegram.org/bots/tutorial
-
-Тесты используют synthetic fixtures, часть числовых примеров из документации. Это НЕ коммерческий прайс и НЕ результат фактической выдачи.
-
-## Исправление CSRF / Railway 1.0.1-rc1
-
-- https://fastapi.tiangolo.com/advanced/behind-a-proxy/
-- https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Origin
-- https://starlette.dev/responses/
-- https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
-
-Опубликованное поведение no-referrer может дать Origin:null в HTML POST.
-В локальном тесте это моделировалось явно; браузерный E2E в среде заблокирован.
+Протокол "No-KYC, без сессии, произвольный TON-перевод в контракт Fragment →
+Stars указанному username" не подтверждён первичной документацией. Он не
+реализован. Вместо него используется документированный Stars API FazerCards;
+условия верификации аккаунта поставщика определяет сам поставщик.

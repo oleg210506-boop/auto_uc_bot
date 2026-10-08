@@ -23,7 +23,7 @@ def locked(fn):
         with self.lock: return fn(self,*a,**kw)
     return call
 
-class Engine:
+class LegacyEngine:
     def __init__(self,db,vault,config):
         self.db,self.vault,self.config=db,vault,config
         self.lock=threading.RLock()
@@ -162,24 +162,27 @@ class Engine:
         quantity=positive_int(d["quantity"],10000)
         units=quantity*p["multiplier"];uc=units*p["sku_uc"]
         reason=""
-        if baseline:reason="Заказ существовал до подключения/перезапуска. Подтвердите, что UC ещё не выдавались."
+        if baseline:reason="Заказ существовал до подключения/перезапуска. Подтвердите, что товар ещё не выдавался."
         if not p["enabled"] or not p["verified"]:reason="Товар не включён или его объявление не проверено"
-        if quantity>self.db.setting("max_quantity") or units>10000:reason="Количество превышает лимит"
+        if quantity>self.rule("max_quantity",p) or units>10000:reason="Количество превышает лимит"
         if d["currency"]!="RUB" or d["revenue"]<=0:reason="Сумма или валюта заказа не поддерживается"
         state="manual" if reason else "awaiting_uid"
         if self.mode()=="observe" and mode=="live":state="observed";reason="Режим наблюдения: никакой выдачи или автоответов"
         now=time.time()
         baseline_messages=[]
+        prior_chat = bool(self.db.one("SELECT 1 FROM chat_controls WHERE chat_id=?", (d["chat_id"],)))
         if mode=="live":
             # Messages already present BEFORE our first request for this order are history,
             # not a new instruction to top up. This prevents an old UID from being reused.
             baseline_messages=self.fp("live").messages({d["chat_id"]:-1})
-        fee=0 if self.db.setting("funpay_sum_is_net") else int(Decimal(d["revenue"])*Decimal(str(self.db.setting("funpay_fee_percent")))/100)
+        fee=0 if self.rule("funpay_sum_is_net",p) else int(Decimal(d["revenue"])*Decimal(str(self.rule("funpay_fee_percent",p)))/100)
         with self.db.tx() as c:
-            c.execute("""INSERT INTO orders(id,mode,product_id,buyer_id,buyer,chat_id,quantity,uc,sku_units,snapshot,state,fp_status,revenue,currency,fee,hold_reason,created,updated)
-                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(d["id"],mode,p["id"],d["buyer_id"],d["buyer"],d["chat_id"],quantity,uc,units,dumps(p),state,d["status"],d["revenue"],d["currency"],fee,reason,now,now))
+            c.execute("""INSERT INTO orders(id,mode,product_id,buyer_id,buyer,chat_id,quantity,uc,sku_units,snapshot,state,fp_status,revenue,currency,fee,hold_reason,created,updated,service,supplier)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(d["id"],mode,p["id"],d["buyer_id"],d["buyer"],d["chat_id"],quantity,uc,units,dumps(p),state,d["status"],d["revenue"],d["currency"],fee,reason,now,now,p.get("service","uc"),p.get("supplier","gamecore")))
             c.execute("INSERT OR IGNORE INTO chat_controls(chat_id) VALUES(?)",(d["chat_id"],))
-            for message in baseline_messages:
+            floor=max((int(m["id"]) for m in baseline_messages if str(m["id"]).isdigit()), default=0)
+            c.execute("UPDATE orders SET last_input=? WHERE id=?", (floor,d["id"]))
+            for message in ([] if prior_chat else baseline_messages):
                 mid=str(message["id"])
                 c.execute("INSERT OR IGNORE INTO seen_messages VALUES(?,?,?)",(d["chat_id"],mid,now))
                 c.execute("INSERT OR IGNORE INTO messages(external_id,chat_id,author,text,direction,created) VALUES(?,?,?,?,?,?)",(mid,d["chat_id"],str(message["author"]),message["text"],"history",now))
@@ -196,7 +199,7 @@ class Engine:
             self.problem(o["id"],"manual","Изменились ключевые данные заказа FunPay",pause=True);raise BusinessError("Заказ FunPay изменился")
         self.db.execute("UPDATE orders SET fp_status=? WHERE id=?",(d["status"],o["id"]))
         if d["status"] in ("refunded","partially_refunded") and o["delivered"]>0:
-            self.alert("manual","Возврат при уже выданных UC","Сверьте расчёты и фактическую сумму возврата",o["id"],key="refund:"+o["id"])
+            self.alert("manual","Возврат при уже выданном товаре","Сверьте расчёты и фактическую сумму возврата",o["id"],key="refund:"+o["id"])
         if d["status"]!="paid" and o["state"]!="completed":
             has_batch=self.db.one("SELECT id FROM batches WHERE order_id=? AND state NOT IN('rejected','balance','retry')",(o["id"],))
             if has_batch:self.alert("manual","Статус FunPay изменился во время выдачи",d["status"],o["id"])
@@ -211,13 +214,14 @@ class Engine:
             c.execute("INSERT OR IGNORE INTO messages(external_id,chat_id,author,text,direction,created) VALUES(?,?,?,?,?,?)",(mid,chat,str(m["author"]),text,"in",now))
             if mid.isdigit():c.execute("UPDATE chat_controls SET last_seen=MAX(last_seen,?) WHERE chat_id=?",(int(mid),chat))
         orders=self.db.rows("SELECT * FROM orders WHERE chat_id=? AND buyer_id=? AND mode=? AND state NOT IN('completed','cancelled','observed') ORDER BY created",(chat,m["author"],self.dataset()))
+        if mid.isdigit():orders=[o for o in orders if int(mid)>o["last_input"]]
         if not orders:return
         control=self.db.one("SELECT * FROM chat_controls WHERE chat_id=?",(chat,))
         if control and control["manual"]:return
         if self.mode()=="observe":return
-        help_words=[x.strip().lower() for x in self.db.setting("help_words").split(",") if x.strip()]
+        help_words=[x.strip().lower() for o in orders for x in self.rule("help_words",o).split(",") if x.strip()]
         words=set(re.findall(r"[\w]+",text.lower()))
-        if self.db.setting("pause_chat_on_help") and any(x in words for x in help_words):
+        if any(self.rule("pause_chat_on_help",o) for o in orders) and any(x in words for x in help_words):
             self.queue(orders[0]["id"],"help",mid,force=True)
             self.db.execute("UPDATE chat_controls SET manual=1 WHERE chat_id=?",(chat,))
             self.alert("manual","Покупатель вызвал оператора",text,orders[0]["id"]);return
@@ -231,18 +235,20 @@ class Engine:
             # A confirmation nonce uniquely identifies an order without an extra selector.
             selected=next((o for o in orders if o["confirm_code"] and text.upper()=="ПОДТВЕРЖДАЮ "+o["confirm_code"]),None)
             if not selected:
-                msg=render_template(self.db.setting("tpl_selection"),orders=", ".join("#"+o["id"] for o in orders))
+                msg=render_template(self.db.setting("tpl_"+orders[0]["service"]+"_selection") if orders[0].get("supplier")=="fazer" else self.db.setting("tpl_selection"),orders=", ".join("#"+o["id"] for o in orders))
                 self.queue_text(orders[0],msg,"selection:"+chat+":"+mid);return
         o=selected
         if o["state"] not in ("awaiting_uid","awaiting_confirmation","ready","waiting_balance"):return
         if self.db.one("SELECT id FROM batches WHERE order_id=?",(o["id"],)):return
         if o["state"]=="awaiting_confirmation" and text.upper()=="ПОДТВЕРЖДАЮ "+str(o["confirm_code"]):
             self.db.execute("UPDATE orders SET state='ready',confirmed=1,updated=? WHERE id=?",(now,o["id"]));return
-        try:uid=validate_uid(text)
+        try:uid=self.validate_recipient(text,o,verify=True)
+        except ProviderError as exc:
+            self.problem(o["id"],"manual",str(exc));return
         except BusinessError:
             self.queue(o["id"],"invalid_uid",mid);return
         code=secrets.token_hex(3).upper()
-        confirm=self.db.setting("confirm_uid")
+        confirm=self.rule("confirm_uid",o)
         self.db.execute("UPDATE orders SET uid=?,confirm_code=?,confirmed=?,state=?,updated=? WHERE id=?",(uid,code,int(not confirm),"awaiting_confirmation" if confirm else "ready",now,o["id"]))
         if confirm:self.queue(o["id"],"confirm_uid",code)
 
@@ -574,3 +580,9 @@ class Engine:
             self.db.set("pause_reason","Демонстрация очищена; реальные данные сохранены",c)
             self.db.audit(actor,"demo.reset",detail=str(count),conn=c)
         return count
+
+
+# Public import remains autoucbot.engine.Engine. Legacy polling is retained for old orders.
+from .commerce import FazerMixin
+class Engine(FazerMixin, LegacyEngine):
+    pass

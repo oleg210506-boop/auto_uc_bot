@@ -1,4 +1,5 @@
 from __future__ import annotations
+from .commerce_config import SERVICE_KEYS
 import csv
 import io
 import json
@@ -30,9 +31,9 @@ from .utils import BusinessError,money,cents,csv_safe,validate_template,positive
 
 LOG=logging.getLogger("uvicorn.error")
 ROOT=Path(__file__).parent
-STATE_NAMES={"awaiting_uid":"Ожидает UID","awaiting_confirmation":"Ожидает подтверждения","ready":"Готов к закупке","waiting_balance":"Ожидает баланса",
+STATE_NAMES={"awaiting_uid":"Ожидает получателя","awaiting_confirmation":"Ожидает подтверждения","ready":"Готов к закупке","waiting_balance":"Ожидает баланса",
  "processing":"Выполняется","unknown":"Результат неизвестен","partial":"Частично выдан","failed":"Ошибка","completed":"Выдан","cancelled":"Отменён/закрыт","manual":"Нужен оператор","observed":"Наблюдение"}
-NAV=[("/","Обзор"),("/orders","Заказы"),("/products","Товары"),("/catalog","Каталог GameCore"),("/customers","Покупатели"),("/stats","Статистика"),("/alerts","Тревоги"),("/connections","Подключения"),("/settings","Настройки"),("/team","Команда"),("/backups","Резервные копии"),("/audit","Журнал"),("/account","Мой доступ")]
+NAV=[("/","Обзор"),("/orders","Заказы"),("/products","Товары"),("/catalog","Каталог FazerCards"),("/customers","Покупатели"),("/stats","Статистика"),("/alerts","Тревоги"),("/connections","Подключения"),("/services/uc","Настройки UC"),("/services/stars","Настройки Stars"),("/settings","Общие настройки"),("/migration","Перенос / домен"),("/team","Команда"),("/backups","Резервные копии"),("/audit","Журнал"),("/account","Мой доступ")]
 
 
 def create_app(config=None):
@@ -50,6 +51,9 @@ def create_app(config=None):
     app.state.db=db;app.state.engine=engine;app.state.worker=worker;app.state.vault=vault
     templates=Jinja2Templates(directory=str(ROOT/"templates"))
     templates.env.filters["money"]=money
+    templates.env.filters["fromjson"]=lambda x:json.loads(x) if isinstance(x,str) else x
+    templates.env.filters["usd"]=lambda x:format(__import__('decimal').Decimal(x)/1000000,'.6f').rstrip('0').rstrip('.')
+    templates.env.filters["unit"]=lambda x:'Stars' if x=='stars' else 'UC' 
     templates.env.filters["stamp"]=lambda x:datetime.fromtimestamp(x,ZoneInfo(db.setting("timezone","Europe/Amsterdam"))).strftime("%d.%m.%Y %H:%M:%S") if x else "—"
     templates.env.filters["jsonpretty"]=lambda x:json.dumps(json.loads(x) if isinstance(x,str) else x,ensure_ascii=False,indent=2)
     templates.env.filters["state"]=lambda x:STATE_NAMES.get(x,x)
@@ -116,13 +120,13 @@ def create_app(config=None):
         if request.headers.get("content-length","").isdigit() and int(request.headers["content-length"])>1_048_576:
             return security_headers(PlainTextResponse("Слишком большой запрос",413))
         request.state.user=None;request.state.csrf=""
-        public=path in ("/login","/healthz","/webhooks/gamecore") or path.startswith("/static/")
+        public=path in ("/login","/healthz","/webhooks/gamecore","/webhooks/fazer") or path.startswith("/static/")
         cookie=request.cookies.get("auc_session","")
         if cookie:
             row=db.one("SELECT u.*,s.csrf,s.token_hash FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>? AND u.active=1",(token_hash(cookie),time.time()))
             if row:request.state.user=row;request.state.csrf=row["csrf"]
         if not public and not request.state.user:return security_headers(redirect("/login"))
-        if request.method=="POST" and path!="/webhooks/gamecore":
+        if request.method=="POST" and path not in ("/webhooks/gamecore","/webhooks/fazer"):
             body=await request.body()
             if len(body)>1_048_576:return security_headers(PlainTextResponse("Слишком большой запрос",413))
             if request.headers.get("content-type","").split(";",1)[0].strip().lower()!="application/x-www-form-urlencoded":
@@ -141,6 +145,8 @@ def create_app(config=None):
             except ValueError:return csrf_failure(request,"CSRF_ORIGIN")
             reason=source_error(request.headers,expected_origin)
             if reason:return csrf_failure(request,reason)
+        if request.method=='POST' and db.setting('migration_frozen',False) and path not in ('/login','/logout','/migration/export','/migration/resume','/webhooks/fazer','/webhooks/gamecore'):
+            return security_headers(PlainTextResponse('Источник заморожен для переноса. Откройте раздел «Перенос / домен».',409))
         try:response=await call_next(request)
         except PermissionError as exc:response=page(request,"error.html",title="Нет доступа",error=str(exc));response.status_code=403
         except (BusinessError,ValueError,sqlite3.IntegrityError) as exc:
@@ -200,10 +206,10 @@ def create_app(config=None):
     async def dashboard(request:Request):
         data=engine.dataset()
         counts=db.rows("SELECT state,COUNT(*) n FROM orders WHERE mode=? GROUP BY state",(data,))
-        return page(request,"dashboard.html",counts=counts,balance=engine.balance(),balance_at=db.setting("balance_verified:"+data),
+        return page(request,"dashboard.html",counts=counts,wallet=engine.wallet_view(),services={k:{"open":engine.direction_open(k),"paused":db.setting("svc_"+k+"_paused",False)} for k in ("uc","stars")},balance=engine.balance(),balance_at=db.setting("balance_verified:"+data),
                     latest=db.rows("SELECT * FROM orders WHERE mode=? ORDER BY created DESC LIMIT 8",(data,)),
                     alerts=db.rows("SELECT * FROM alerts WHERE active=1 ORDER BY updated DESC LIMIT 5"),
-                    runtime=db.rows("SELECT * FROM runtime WHERE key IN('worker','funpay','catalog:live','raise','balance_api') ORDER BY key"),
+                    runtime=db.rows("SELECT * FROM runtime WHERE key IN('worker','funpay','catalog:live','raise','balance_api','fazer_wallet:live','fazer_wallet:demo') ORDER BY key"),
                     reasons=engine.live_ready(),pause_reason=db.setting("pause_reason",""),live_armed=db.setting("live_armed"))
     @app.post("/control")
     async def control(request:Request):
@@ -228,7 +234,7 @@ def create_app(config=None):
                 db.set("mode",action);db.set("paused",True);db.set("pause_reason","Режим изменён: проверьте настройки перед запуском")
                 worker.fp_baselined.clear()
             elif action=="recovery_clear":
-                if f.get("ack")!="ИСТОРИЯ СВЕРЕНА":raise BusinessError("Введите ИСТОРИЯ СВЕРЕНА только после проверки FunPay и всех списаний GameCore после даты копии")
+                if f.get("ack")!="ИСТОРИЯ СВЕРЕНА":raise BusinessError("Введите ИСТОРИЯ СВЕРЕНА только после проверки FunPay и всех списаний поставщиков после даты копии")
                 db.set("recovery_required",False)
             else:raise BusinessError("Неизвестное действие")
             db.audit(actor(request),"control",action)
@@ -240,6 +246,8 @@ def create_app(config=None):
         where="mode=?";args=[mode]
         if query:where+=" AND (id LIKE ? OR uid LIKE ? OR buyer LIKE ?)";args.extend(["%"+query+"%"]*3)
         if state in STATE_NAMES:where+=" AND state=?";args.append(state)
+        service=request.query_params.get('service','')
+        if service in ('uc','stars'):where+=' AND service=?';args.append(service)
         return where,args
     @app.get("/orders",response_class=HTMLResponse)
     async def orders(request:Request):
@@ -250,7 +258,7 @@ def create_app(config=None):
     async def order_page(request:Request,oid:str):
         o=require_order(oid)
         return page(request,"order.html",order=o,batches=db.rows("SELECT * FROM batches WHERE order_id=?",(oid,)),
-                    provider_orders=db.rows("SELECT p.* FROM provider_orders p JOIN batches b ON b.id=p.batch_id WHERE b.order_id=?",(oid,)),
+                    fazer_parts=db.rows("SELECT p.* FROM fazer_parts p JOIN batches b ON b.id=p.batch_id WHERE b.order_id=? ORDER BY ordinal",(oid,)),provider_orders=db.rows("SELECT p.* FROM provider_orders p JOIN batches b ON b.id=p.batch_id WHERE b.order_id=?",(oid,)),
                     messages=db.rows("SELECT * FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 100",(o["chat_id"],))[::-1],
                     control=db.one("SELECT * FROM chat_controls WHERE chat_id=?",(o["chat_id"],)),
                     finance=db.one("SELECT * FROM order_finance WHERE order_id=?",(oid,)) or {},tasks=db.rows("SELECT * FROM tasks ORDER BY id DESC LIMIT 8"),outbox=db.rows("SELECT * FROM outbox WHERE order_id=? ORDER BY id DESC LIMIT 20",(oid,)))
@@ -261,7 +269,7 @@ def create_app(config=None):
             if action=="check":tid=worker.enqueue("check_order",{"id":oid});notice=task_notice(tid)
             elif action=="adopt":
                 owner(request)
-                if f.get("ack")!="UC НЕ ВЫДАВАЛИСЬ":raise BusinessError("Подтвердите UC НЕ ВЫДАВАЛИСЬ после проверки истории")
+                if f.get("ack") not in ("UC НЕ ВЫДАВАЛИСЬ","ТОВАР НЕ ВЫДАВАЛСЯ"):raise BusinessError("Подтвердите ТОВАР НЕ ВЫДАВАЛСЯ после проверки истории")
                 tid=worker.enqueue("adopt",{"id":oid,"actor":actor(request)});notice=task_notice(tid)
             elif action=="take":
                 c=db.one("SELECT * FROM chat_controls WHERE chat_id=?",(o["chat_id"],))
@@ -282,7 +290,7 @@ def create_app(config=None):
                 owner(request)
                 if f.get("ack")!="СВЕРЕНО ВРУЧНУЮ":raise BusinessError("Введите СВЕРЕНО ВРУЧНУЮ после проверки фактической выдачи/возврата")
                 engine.manual_resolution(oid,action,f.get("manual_cost",0),f.get("refund",0),str(f.get("proof","")),actor(request))
-                notice="Ручной результат записан. Эта кнопка не покупала UC и не переводила возврат на FunPay."
+                notice="Ручной результат записан. Эта кнопка не покупала товар и не переводила возврат на FunPay."
             elif action=="note":db.execute("UPDATE orders SET note=? WHERE id=?",(str(f.get("note",""))[:3000],oid));notice="Заметка сохранена"
             elif action=="demo_message":
                 if o["mode"]!="demo" or engine.mode()!="demo":raise BusinessError("Это действие только для демо")
@@ -295,7 +303,8 @@ def create_app(config=None):
         owner(request);f=await request.form();scenario=str(f.get("scenario","success"))
         if scenario not in ("success","balance","unknown_before","unknown_after","partial","failed","pending","split"):raise BusinessError("Неизвестный сценарий")
         db.set("demo_scenario",scenario)
-        oid=engine.seed_demo(positive_int(f.get("quantity",3)),60)
+        service=str(f.get('service','legacy'))
+        oid=engine.seed_fazer_demo(service,positive_int(f.get('quantity',1)),positive_int(f.get('denomination',50 if service=='stars' else 60))) if service in ('uc','stars') else engine.seed_demo(positive_int(f.get("quantity",3)),60)
         db.audit(actor(request),"demo.created",oid,scenario)
         return redirect("/orders/"+oid,"Это локальная демонстрация. Денег не списывает.")
 
@@ -310,7 +319,7 @@ def create_app(config=None):
     async def catalog_page(request:Request):
         mode=request.query_params.get("mode",engine.dataset());mode="live" if mode=="live" else "demo"
         return page(request,"catalog.html",catalog=db.rows("SELECT * FROM catalog WHERE mode=? ORDER BY uc,id",(mode,)),catalog_mode=mode,
-                    tasks=db.rows("SELECT * FROM tasks WHERE kind='catalog' ORDER BY id DESC LIMIT 6"))
+                    tasks=db.rows("SELECT * FROM tasks WHERE kind IN('catalog','fazer_catalog') ORDER BY id DESC LIMIT 6"))
     @app.get("/products",response_class=HTMLResponse)
     async def products(request:Request):
         return page(request,"products.html",products=db.rows("SELECT * FROM products WHERE mode=? ORDER BY archived,id",(engine.dataset(),)))
@@ -344,7 +353,8 @@ def create_app(config=None):
         owner(request)
         return page(request,"connections.html",secret_status={k:bool(vault.get(k)) for k in SECRET_ENV},env_secrets={k:bool(os.getenv(v)) for k,v in SECRET_ENV.items()},
                     settings={k:db.setting(k) for k in FIELDS},balance=engine.balance(),tasks=db.rows("SELECT * FROM tasks ORDER BY id DESC LIMIT 20"),
-                    webhook_url=config.public_url+"/webhooks/gamecore" if config.public_url else "Сначала задайте PUBLIC_URL")
+                    wallet=engine.wallet_view(),profile=db.setting('fazer_profile:live',{}),plans=db.setting('fazer_plans',{}),discovered=db.setting('fazer_discovered',[]),
+                    webhook_url=config.public_url+"/webhooks/fazer" if config.public_url else "Сначала задайте PUBLIC_URL")
     @app.post("/connections/secrets")
     async def save_secrets(request:Request):
         owner(request);f=await request.form()
@@ -363,9 +373,9 @@ def create_app(config=None):
     @app.post("/tasks")
     async def tasks(request:Request):
         owner(request);f=await request.form();kind=str(f.get("kind"))
-        if kind not in ("catalog","funpay_test","telegram_test","telegram_recipients","balance_api","backup"):raise BusinessError("Действие не разрешено")
+        if kind not in ("catalog","funpay_test","telegram_test","telegram_recipients","balance_api","backup","fazer_test","fazer_balance","fazer_discover","fazer_catalog","fazer_validation"):raise BusinessError("Действие не разрешено")
         payload={}
-        if kind=="catalog":payload["mode"]="live" if f.get("mode")=="live" else engine.dataset()
+        if kind in ("catalog","fazer_catalog","fazer_balance"):payload["mode"]="live" if f.get("mode")=="live" else "demo" if f.get("mode")=="demo" else engine.dataset()
         if kind=="telegram_test":payload["chat_id"]=str(f.get("chat_id",""))
         tid=worker.enqueue(kind,payload);db.audit(actor(request),"task.queued",tid,kind)
         return redirect("/connections",task_notice(tid))
@@ -373,7 +383,7 @@ def create_app(config=None):
     @app.get("/settings",response_class=HTMLResponse)
     async def settings(request:Request):
         owner(request)
-        return page(request,"settings.html",fields=FIELDS,values={k:db.setting(k) for k in FIELDS},templates=TEMPLATES,tpl_values={k:db.setting("tpl_"+k) for k in TEMPLATES})
+        return page(request,"settings.html",fields=FIELDS,legacy_keys=set(SERVICE_KEYS)|{k for k in FIELDS if k.startswith("balance_")},values={k:db.setting(k) for k in FIELDS},templates=TEMPLATES,tpl_values={k:db.setting("tpl_"+k) for k in TEMPLATES})
     @app.post("/settings")
     async def settings_save(request:Request):
         owner(request);f=await request.form();values={}
@@ -413,7 +423,7 @@ def create_app(config=None):
     @app.get("/customers",response_class=HTMLResponse)
     async def customers(request:Request):
         q=request.query_params.get("q","")[:100]
-        rows=db.rows("SELECT buyer_id,buyer,COUNT(*) orders,SUM(revenue) revenue,SUM(delivered) uc,MAX(created) last FROM orders WHERE mode=? AND buyer LIKE ? GROUP BY buyer_id ORDER BY last DESC LIMIT 200",(engine.dataset(),"%"+q+"%"))
+        rows=db.rows("SELECT buyer_id,buyer,COUNT(*) orders,SUM(revenue) revenue,SUM(CASE WHEN service='uc' THEN delivered ELSE 0 END) uc,SUM(CASE WHEN service='stars' THEN delivered ELSE 0 END) stars,MAX(created) last FROM orders WHERE mode=? AND buyer LIKE ? GROUP BY buyer_id ORDER BY last DESC LIMIT 200",(engine.dataset(),"%"+q+"%"))
         return page(request,"customers.html",customers=rows)
 
     def stats_range(request):
@@ -425,24 +435,31 @@ def create_app(config=None):
     @app.get("/stats",response_class=HTMLResponse)
     async def stats(request:Request):
         start,end,a,b=stats_range(request);mode=engine.dataset()
+        service=request.query_params.get('service','')
+        service=service if service in ('uc','stars') else '' 
         sql="""WITH costs AS (SELECT order_id,SUM(net_cost) cost FROM batches GROUP BY order_id),
             detail AS (SELECT o.*,COALESCE(c.cost,0)+COALESCE(f.manual_cost,0) cost,
             CASE WHEN o.fp_status='refunded' THEN o.revenue ELSE COALESCE(f.refund,0) END refund
             FROM orders o LEFT JOIN costs c ON c.order_id=o.id LEFT JOIN order_finance f ON f.order_id=o.id
-            WHERE o.mode=? AND o.created>=? AND o.created<?)
-            SELECT COUNT(*) n,COALESCE(SUM(state='completed'),0) complete,COALESCE(SUM(delivered),0) uc,
+            WHERE o.mode=? AND o.created>=? AND o.created<? AND (?='' OR o.service=?))
+            SELECT COUNT(*) n,COALESCE(SUM(state='completed'),0) complete,COALESCE(SUM(CASE WHEN service='uc' THEN delivered ELSE 0 END),0) uc,COALESCE(SUM(CASE WHEN service='stars' THEN delivered ELSE 0 END),0) stars,
             COALESCE(SUM(CASE WHEN state='completed' THEN revenue-refund ELSE 0 END),0) gross,
             COALESCE(SUM(CASE WHEN state IN('completed','cancelled','failed','partial') THEN cost ELSE 0 END),0) cost,
             COALESCE(SUM(CASE WHEN state='completed' AND refund<revenue THEN fee ELSE 0 END),0) fee,
             COALESCE(SUM(CASE WHEN state NOT IN('completed','cancelled','failed','partial') THEN cost ELSE 0 END),0) pending,
             COALESCE(SUM(refund),0) refunds FROM detail"""
-        agg=db.one(sql,(mode,a,b))
+        agg=db.one(sql,(mode,a,b,service,service))
         gross,fee,cost=agg["gross"],agg["fee"],agg["cost"]
-        extra=int(cost*db.setting("provider_fee_percent")/100)
+        extra=0
+        for direction in ('uc','stars'):
+            if service and direction!=service:continue
+            estimate=db.one("SELECT COALESCE(SUM(b.net_cost),0) n FROM batches b JOIN orders o ON o.id=b.order_id WHERE o.mode=? AND o.service=? AND o.created>=? AND o.created<? AND o.state IN('completed','cancelled','failed','partial')",(mode,direction,a,b))['n']
+            extra+=int(estimate*engine.service_rule(direction,'provider_fee_percent')/100)
         expenses=db.rows("SELECT * FROM expenses WHERE created>=? AND created<? ORDER BY created DESC LIMIT 200",(a,b)) if mode=="live" else []
         overhead=db.one("SELECT COALESCE(SUM(amount),0) n FROM expenses WHERE created>=? AND created<?",(a,b))["n"] if mode=="live" else 0
-        summary={"count":agg["n"],"complete":agg["complete"],"gross":gross,"cost":cost,"fee":fee+extra,"profit":gross-fee-cost-extra-overhead,"uc":agg["uc"],"average":int(gross/agg["complete"]) if agg["complete"] else 0,"expenses":overhead,"pending":agg["pending"],"refunds":agg["refunds"]}
-        return page(request,"stats.html",summary=summary,start=start,end=end,expenses=expenses)
+        summary={"count":agg["n"],"complete":agg["complete"],"gross":gross,"cost":cost,"fee":fee+extra,"profit":gross-fee-cost-extra-overhead,"uc":agg["uc"],"stars":agg["stars"],"average":int(gross/agg["complete"]) if agg["complete"] else 0,"expenses":overhead,"pending":agg["pending"],"refunds":agg["refunds"]}
+        estimates=db.one("SELECT COUNT(*) n FROM fazer_parts p JOIN batches b ON b.id=p.batch_id JOIN orders o ON o.id=b.order_id WHERE o.mode=? AND o.created>=? AND o.created<? AND (?='' OR o.service=?) AND p.state IN('sending','unknown','processing','completed','failed','refund') AND p.cost_source='quote'",(mode,a,b,service,service))['n']
+        return page(request,"stats.html",summary=summary,start=start,end=end,expenses=expenses,service=service,estimates=estimates)
     @app.post("/stats/expense")
     async def expense(request:Request):
         owner(request);f=await request.form();amount=cents(f.get("amount"));description=str(f.get("description","")).strip()[:500]
@@ -457,7 +474,7 @@ def create_app(config=None):
         def generate():
             out=io.StringIO();w=csv.writer(out,delimiter=";")
             yield "\ufeff".encode("utf-8")
-            columns=["id","mode","buyer","uid","quantity","uc","delivered","state","revenue","fee","created"]
+            columns=["id","mode","service","supplier","buyer","uid","quantity","uc","delivered","state","revenue","fee","created"]
             w.writerow(columns);yield out.getvalue().encode("utf-8");out.seek(0);out.truncate()
             conn=db.connect()
             try:
@@ -566,6 +583,8 @@ def create_app(config=None):
                 for b in c.execute("SELECT id,payload FROM batches WHERE state='unknown'").fetchall():
                     if json.loads(b["payload"]).get("externalOrderId")==external:c.execute("UPDATE batches SET next_check=0 WHERE id=?",(b["id"],))
         return JSONResponse({"ok":True})
+    from .web_commerce import install
+    install(app,db,engine,worker,vault,config,page,redirect,owner,actor)
     # Added last so proxy interpretation runs BEFORE security and routing,
     # including when another ASGI launcher calls create_app directly.
     trusted = [part.strip() for part in config.forwarded_allow_ips.split(",") if part.strip()]

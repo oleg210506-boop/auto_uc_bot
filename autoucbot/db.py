@@ -55,6 +55,8 @@ class DB:
             c.execute("INSERT OR IGNORE INTO settings VALUES('mode','\"demo\"')")
             c.execute("INSERT OR IGNORE INTO settings VALUES('paused','true')")
             c.execute("INSERT OR IGNORE INTO settings VALUES('live_armed','false')")
+        from .migrations import migrate
+        migrate(self)
         try: os.chmod(self.path, 0o600)
         except OSError: pass
 

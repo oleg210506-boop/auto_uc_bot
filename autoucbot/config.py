@@ -74,9 +74,9 @@ FIELDS = {
     "max_order_rub": ("money", 2000, "Лимит закупки на заказ, ₽", "Локальная предварительная проверка, не потолок цены в API.", 1, 1000000),
     "daily_limit_rub": ("money", 5000, "Лимит закупок в сутки, ₽", "Сутки определяются в выбранном часовом поясе.", 1, 10000000),
     "max_quantity": ("int", 100, "Максимум штук в заказе FunPay", "Большее количество уходит на ручную проверку.", 1, 10000),
-    "price_buffer_percent": ("number", 3.0, "Резерв на изменение цены, %", "GameCore не принимает максимальную цену в запросе.", 0, 100),
+    "price_buffer_percent": ("number", 3.0, "Резерв на изменение цены, %", "Проверка котировки и резерв не фиксируют цену у поставщика.", 0, 100),
     "funpay_fee_percent": ("number", 0.0, "Учитываемая комиссия FunPay, %", "Введите фактическую ставку; 0 не является обещанием отсутствия комиссии.", 0, 90),
-    "provider_fee_percent": ("number", 0.0, "Комиссия пополнения/конвертации GameCore, %", "Используется в оценке себестоимости.", 0, 90),
+    "provider_fee_percent": ("number", 0.0, "Комиссия пополнения/конвертации поставщика, %", "Используется в оценке себестоимости.", 0, 90),
     "funpay_sum_is_net": ("bool", False, "Сумма заказа уже после комиссии", "Включите только после сверки реального заказа."),
     "alert_repeat_seconds": ("int", 1800, "Повтор критической тревоги, секунд", "Подтверждённая тревога не повторяется.", 60, 86400),
     "alert_chat_ids": ("text", "", "Telegram chat_id получателей", "Числа через запятую; каждый пользователь должен нажать Start у бота."),
@@ -92,7 +92,7 @@ FIELDS = {
     "balance_ttl_seconds": ("int", 120, "Максимальный возраст API-остатка, секунд", "Просроченный API-остаток запрещает новую закупку.", 30, 3600),
     "fees_confirmed": ("bool", False, "Тарифы и комиссии сверены с поставщиком", "Условие включения live."),
     "dynamic_price_accepted": ("bool", False, "Понимаю риск изменения цены при создании заказа", "API не фиксирует котировку и не принимает верхний предел."),
-    "provider_terms_confirmed": ("bool", False, "GameCore подтвердил предоплату и работу без IP-привязки", "Без кредитного лимита; постоянный IP в этой сборке не используется."),
+    "provider_terms_confirmed": ("bool", False, "Проверены условия FazerCards: предоплата, подписка и доступ API", "Без кредитного лимита; постоянный IP в этой сборке не используется."),
     "stats_from": ("text", "", "Начало статистического периода", "Дата YYYY-MM-DD. Фильтр, а не удаление истории."),
 }
 TEMPLATES = {
@@ -109,3 +109,12 @@ TEMPLATES = {
     "cancelled": ("Отменённый заказ", "Заказ #{order_id} больше не ожидает выдачи. Если пополнение уже было отправлено, его результат проверит администратор."),
 }
 SECRET_ENV = {"gamecore_key": "GAMECORE_API_KEY", "webhook_secret": "GAMECORE_WEBHOOK_SECRET", "funpay_key": "FUNPAY_GOLDEN_KEY", "funpay_user_agent": "FUNPAY_USER_AGENT", "telegram_token": "TELEGRAM_BOT_TOKEN"}
+
+# FazerCards uses USD. These are explicit accounting inputs, not exchange-rate guesses.
+FIELDS.update({
+    'fazer_usd_rub': ('number', 0, 'Учётный курс: ₽ за 1 USD FazerCards', 'Введите фактическую стоимость закупки USD. Нулевой курс запрещает live-закупки.', 0, 10000),
+    'fazer_low_usd': ('number', 10, 'Низкий баланс FazerCards, USD', 'Читается по API /balance, отдельно от старой книги GameCore.', 0, 1000000),
+    'fazer_balance_seconds': ('int', 60, 'Опрос баланса FazerCards, секунд', 'Новые закупки дополнительно проверяют остаток перед отправкой.', 30, 3600),
+    'fazer_categories': ('text', '', 'ID категорий UC FazerCards', 'После «Найти категории UC» скопируйте нужные category_id через запятую. Пусто — UC не загружаются.'),
+})
+SECRET_ENV.update({'fazer_key': 'FAZER_API_KEY', 'fazer_webhook_secret': 'FAZER_WEBHOOK_SECRET'})

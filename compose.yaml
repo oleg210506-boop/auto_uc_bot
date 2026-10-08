@@ -1,0 +1,63 @@
+# VPS deployment: one app process + Caddy HTTPS. No public application port.
+# Keep ./data and the original APP_SECRET during every upgrade or migration.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 65s
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      PORT: '8080'
+      PUBLIC_URL: https://${APP_DOMAIN:?Set APP_DOMAIN in .env}
+      COOKIE_SECURE: 'true'
+      START_WORKER: 'true'
+      FORWARDED_ALLOW_IPS: 172.30.80.0/24
+    volumes:
+      - ./data:/data
+    expose:
+      - '8080'
+    networks:
+      - panel
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?Set APP_DOMAIN in .env}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - panel
+    depends_on:
+      app:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+networks:
+  panel:
+    ipam:
+      config:
+        - subnet: 172.30.80.0/24
+volumes:
+  caddy_data:
+  caddy_config:

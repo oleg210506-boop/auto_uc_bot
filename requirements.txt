@@ -8,3 +8,4 @@ cryptography==46.0.4
 beautifulsoup4==4.14.3
 python-multipart==0.0.29
 qrcode[pil]==8.2
+httpx==0.28.1

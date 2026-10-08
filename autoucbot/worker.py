@@ -37,6 +37,7 @@ class Worker:
     def start(self):
         self.lock.acquire()
         self.db.execute("UPDATE batches SET state='unknown',next_check=0 WHERE state='sending'")
+        self.db.execute("UPDATE fazer_parts SET state='unknown',next_check=0 WHERE state='sending'")
         self.db.execute("UPDATE outbox SET state='uncertain' WHERE state='sending'")
         self.db.execute("UPDATE tasks SET state='error',result='Перезапуск: действие нужно проверить; автоматически не повторено',updated=? WHERE state='running'",(time.time(),))
         self.thread=threading.Thread(target=self.run,name="autoucbot-worker",daemon=True);self.thread.start()
@@ -50,15 +51,16 @@ class Worker:
         self.lock.release();self.tg.close()
 
     def schedule(self,key,interval,fn):
+        if self.db.setting("migration_frozen",False):return
         if time.time()<self.due.get(key,0):return
         self.due[key]=time.time()+interval
         try:fn()
         except Exception as exc:
             # Never log request headers, tokens, response bodies or buyer data to Railway logs.
             detail=str(exc) if isinstance(exc,(BusinessError,ProviderError,FunPayError)) else "Внутренняя ошибка: "+type(exc).__name__
-            self.e.alert("manual" if key not in ("funpay","catalog") else "funpay" if key=="funpay" else "gamecore",f"Ошибка: {key}",detail,key="worker:"+key)
+            self.e.alert("manual" if key not in ("funpay","catalog") else "funpay" if key=="funpay" else "fazer",f"Ошибка: {key}",detail,key="worker:"+key)
             self.db.runtime(key,{"ok":False,"error":detail})
-            if key=="catalog" and self.e.dataset()=="live":self.e.pause("Каталог GameCore недоступен: проверьте подключение")
+            if key=="catalog" and self.e.dataset()=="live":self.e.alert("fazer","Каталог FazerCards недоступен",detail,key="fazer:catalog")
             self.due[key]=time.time()+max(interval,30)
 
     def run(self):
@@ -71,6 +73,7 @@ class Worker:
 
     def tick(self):
         self.db.runtime("worker",{"ok":True,"pid":os.getpid()})
+        if self.db.setting("migration_frozen",False):return
         self.schedule("tasks",1,self.tasks)
         self.schedule("funpay",self.db.setting("funpay_poll_seconds"),self.funpay)
         self.schedule("purchases",2,self.purchases)
@@ -80,13 +83,23 @@ class Worker:
         self.schedule("telegram",15,self.alerts)
         self.schedule("lots",60,self.lots)
         self.schedule("catalog",self.db.setting("catalog_seconds"),self.catalog)
+        self.schedule("fazer_wallet",self.db.setting("fazer_balance_seconds"),self.fazer_wallet)
         self.schedule("backups",60,self.backups)
         self.schedule("cleanup",3600,self.cleanup)
         self.startup=False
 
     def catalog(self):
-        if self.e.dataset()=="demo" or self.e.vault.get("gamecore_key"):
+        if self.e.dataset()=="demo":
+            # The legacy demo catalog must not erase the new Fazer demo SKUs.
+            if self.db.one("SELECT id FROM products WHERE mode='demo' AND supplier='fazer'"):
+                self.e.sync_fazer_catalog('demo')
+            else:self.e.sync_catalog('demo')
+        elif self.e.vault.get("fazer_key"):
             self.e.sync_catalog()
+
+    def fazer_wallet(self):
+        if self.e.dataset()=='live' and self.e.vault.get('fazer_key'):
+            self.e.read_fazer_wallet('live')
 
     def enqueue(self,kind,payload=None):
         now=time.time()
@@ -98,8 +111,22 @@ class Worker:
         self.db.execute("UPDATE tasks SET state='running',updated=? WHERE id=?",(time.time(),task["id"]))
         try:
             with self.e.lock:
+                if self.db.setting("migration_frozen",False):raise BusinessError("Установка заморожена")
                 p=json.loads(task["payload"]);kind=task["kind"]
                 if kind=="catalog":result=f"Загружено товаров: {self.e.sync_catalog(p.get('mode'))}"
+                elif kind=="fazer_test":
+                    profile=self.e.fazer_account('live',True)
+                    balance=self.e.read_fazer_wallet('live')
+                    plans=self.e.fazer('live').plans()
+                    self.db.set('fazer_plans',plans)
+                    result=dumps({'account':profile,'balance_usd':str(Decimal(balance)/1000000),'plans':plans})
+                elif kind=="fazer_balance":result=str(Decimal(self.e.read_fazer_wallet(p.get('mode','live')))/1000000)+' USD'
+                elif kind=="fazer_discover":result=dumps(self.e.discover_fazer())
+                elif kind=="fazer_catalog":result='Товаров FazerCards: '+str(self.e.sync_fazer_catalog(p.get('mode','live')))
+                elif kind=="fazer_validation":
+                    result=dumps(self.e.fazer('live').validation_games());self.db.set('fazer_validation_games',json.loads(result))
+                elif kind=="fazer_bind":
+                    self.e.bind_fazer_order(p['id'],p['code'],p['proof'],p['actor']);result='Операция привязана после ручной сверки, новая покупка не отправлялась'
                 elif kind=="funpay_test":
                     result=dumps(self.e.fp("live").connect());self.db.runtime("funpay",{"ok":True})
                 elif kind=="verify_product":result=self.e.verify_product(int(p["id"]))
@@ -134,6 +161,7 @@ class Worker:
         if mode=="demo":return
         if not self.e.vault.get("funpay_key"):return
         with self.e.lock:
+            if self.db.setting("migration_frozen",False):return
             fp=self.e.fp("live");fp.ensure()
             products=self.db.rows("SELECT * FROM products WHERE mode='live' AND archived=0 AND verified=1")
             # Chat polling remains frequent; heavy sales HTML is read when counters
@@ -166,11 +194,17 @@ class Worker:
 
     def purchases(self):
         if not self.e.purchase_allowed(self.e.dataset()):return
-        retry=self.db.one("SELECT b.id FROM batches b JOIN orders o ON o.id=b.order_id WHERE o.mode=? AND b.state='retry' AND b.next_check<=? ORDER BY b.id LIMIT 1",(self.e.dataset(),time.time()))
-        if retry:
-            self.e.send_batch(retry["id"]);return
-        row=self.db.one("SELECT id FROM orders WHERE mode=? AND state='ready' ORDER BY created LIMIT 1",(self.e.dataset(),))
-        if row:self.e.prepare(row["id"])
+        # Filter by direction before selecting the queue head; a paused Stars
+        # purchase cannot starve unrelated UC orders (and vice versa).
+        candidates=self.db.rows("SELECT b.id,o.service,o.supplier,o.mode FROM batches b JOIN orders o ON o.id=b.order_id WHERE o.mode=? AND b.state='retry' AND b.next_check<=? ORDER BY b.next_check,b.id",(self.e.dataset(),time.time()))
+        for row in candidates:
+            if row['supplier']=='fazer' and not self.e.direction_open(row['service']):continue
+            if row['supplier']=='gamecore' and row['mode']=='live':continue
+            self.db.execute('UPDATE batches SET next_check=? WHERE id=?',(time.time()+3,row['id']))
+            self.e.send_batch(row['id']);return
+        for row in self.db.rows("SELECT * FROM orders WHERE mode=? AND state='ready' ORDER BY created",(self.e.dataset(),)):
+            if row['supplier']=='fazer' and not self.e.direction_open(row['service']):continue
+            self.e.prepare(row['id']);return
 
     def poll(self):
         rows=self.db.rows("SELECT b.* FROM batches b JOIN orders o ON o.id=b.order_id WHERE b.state IN('accepted','processing','unknown') AND b.next_check<=? ORDER BY b.next_check LIMIT 5",(time.time(),))
@@ -183,7 +217,7 @@ class Worker:
                 message=str(exc) if isinstance(exc,(BusinessError,ProviderError)) else "Не удалось проверить результат: "+type(exc).__name__
                 self.e.alert("unknown","Не удалось сверить пополнение",message,b["order_id"])
                 if isinstance(exc,BusinessError):self.e.pause(message)
-        if self.db.setting("balance_mode")=="api" and self.e.dataset()=="live" and time.time()>self.due.get("api_balance",0):
+        if self.db.setting("balance_mode")=="api" and self.e.dataset()=="live" and self.e.vault.get("gamecore_key") and time.time()>self.due.get("api_balance",0):
             self.due["api_balance"]=time.time()+self.db.setting("balance_ttl_seconds")
             self.enqueue("balance_api")
 
@@ -197,7 +231,9 @@ class Worker:
                 self.db.execute("UPDATE outbox SET state='suppressed' WHERE id=?",(m["id"],));continue
             self.db.execute("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=?",(m["id"],))
             try:
-                with self.e.lock:self.e.fp(m["mode"]).send(m["chat_id"],m["text"])
+                with self.e.lock:
+                    if self.db.setting("migration_frozen",False):raise BusinessError("Установка заморожена")
+                    self.e.fp(m["mode"]).send(m["chat_id"],m["text"])
                 with self.db.tx() as c:
                     c.execute("UPDATE outbox SET state='sent' WHERE id=?",(m["id"],))
                     c.execute("INSERT INTO messages(chat_id,order_id,author,text,direction,created) VALUES(?,?,?,?,?,?)",(m["chat_id"],m["order_id"],"autoUCbot" if m["kind"]=="auto" else "operator",m["text"],"out",time.time()))
@@ -209,9 +245,9 @@ class Worker:
         if self.e.mode()=="observe":return
         now=time.time()
         for o in self.db.rows("SELECT * FROM orders WHERE mode=? AND state IN('awaiting_uid','awaiting_confirmation')",(self.e.dataset(),)):
-            if now-o["created"]>self.db.setting("uid_timeout_seconds"):
-                self.e.alert("manual","Покупатель долго не присылает UID/подтверждение","Автоматический возврат не выполняется",o["id"],key="uid:"+o["id"])
-            if self.db.setting("reminders") and o["reminder_count"]<self.db.setting("reminder_limit") and now-max(o["last_reminder"],o["created"])>self.db.setting("reminder_seconds"):
+            if now-o["created"]>self.e.rule("uid_timeout_seconds",o):
+                self.e.alert("manual","Покупатель долго не присылает получателя/подтверждение","Автоматический возврат не выполняется",o["id"],key="uid:"+o["id"])
+            if self.e.rule("reminders",o) and o["reminder_count"]<self.e.rule("reminder_limit",o) and now-max(o["last_reminder"],o["created"])>self.e.rule("reminder_seconds",o):
                 self.e.queue(o["id"],"reminder",str(o["reminder_count"]))
                 self.db.execute("UPDATE orders SET reminder_count=reminder_count+1,last_reminder=? WHERE id=?",(now,o["id"]))
 
@@ -240,8 +276,13 @@ class Worker:
         kinds={s.strip() for s in self.db.setting("alert_kinds").split(",")}
         now=time.time()
         for a in self.db.rows("SELECT * FROM alerts WHERE active=1 AND acked=0 ORDER BY created LIMIT 20"):
-            if a["kind"] not in kinds:continue
-            for recipient in recipients:
+            if a["kind"] not in kinds and a['kind']!='fazer':continue
+            targets=recipients
+            row=self.db.one('SELECT * FROM orders WHERE id=?',(a['order_id'],)) if a['order_id'] else None
+            if row and row['supplier']=='fazer':
+                configured=self.e.service_rule(row['service'],'alert_chat_ids')
+                if configured:targets=[x.strip() for x in configured.split(',') if x.strip()]
+            for recipient in targets:
                 last=self.db.one("SELECT sent FROM alert_deliveries WHERE alert_id=? AND chat_id=?",(a["id"],recipient))
                 if last and now-last["sent"]<self.db.setting("alert_repeat_seconds"):continue
                 link=(self.e.config.public_url+"/orders/"+a["order_id"]) if a["order_id"] and self.e.config.public_url else self.e.config.public_url
@@ -253,10 +294,11 @@ class Worker:
         if self.e.mode()!="live" or not self.db.setting("live_armed") or not self.e.config.enable_live:return
         products=self.db.rows("SELECT * FROM products WHERE mode='live' AND verified=1 AND archived=0")
         with self.e.lock:
+            if self.db.setting("migration_frozen",False):return
             fp=self.e.fp("live")
             for p in products:
-                hide=self.db.setting("paused") or not p["enabled"] or not p["available"]
-                if self.db.setting("auto_hide") and p["manage_active"]:
+                hide=self.db.setting("paused") or not p["enabled"] or not p["available"] or (p["supplier"]=="fazer" and not self.e.direction_open(p["service"]))
+                if self.e.rule("auto_hide",p) and p["manage_active"]:
                     if hide and not p["bot_hidden"]:
                         lot=fp.lot(p["fp_lot_id"])
                         if lot["active"]:
@@ -266,22 +308,29 @@ class Worker:
                         fp.change_lot(p,active=True)
                         self.db.execute("UPDATE products SET bot_hidden=0 WHERE id=?",(p["id"],))
                 if p["auto_price"] and not hide and p["last_price"]:
-                    cost=Decimal(p["last_price"]*p["multiplier"])*(1+Decimal(str(self.db.setting("provider_fee_percent")))/100)
-                    gross=(cost*(1+Decimal(str(p["markup"]))/100)+p["min_profit"])/(1-Decimal(str(self.db.setting("funpay_fee_percent")))/100)
+                    cost=Decimal(p["last_price"]*p["multiplier"])
+                    if p['supplier']=='fazer':
+                        cat=self.db.one('SELECT payload FROM catalog WHERE mode=? AND id=?',(p['mode'],p['sku_id']))
+                        if not cat:continue
+                        meta=json.loads(cat['payload'])
+                        cost=Decimal(meta['price_usd'])*Decimal(str(self.db.setting('fazer_usd_rub')))*100*p['multiplier']
+                    cost*=1+Decimal(str(self.e.rule("provider_fee_percent",p)))/100
+                    gross=(cost*(1+Decimal(str(p["markup"]))/100)+p["min_profit"])/(1-Decimal(str(self.e.rule("funpay_fee_percent",p)))/100)
                     price=int(gross.to_integral_value(rounding=ROUND_CEILING))
                     if price!=p["sale_price"]:
                         fp.change_lot(p,price=price)
                         self.db.execute("UPDATE products SET sale_price=? WHERE id=?",(price,p["id"]))
                         self.db.audit("system","lot.price",p["id"],str(price))
-            if self.db.setting("auto_raise") and not self.db.setting("paused"):
+            if not self.db.setting("paused"):
                 groups={}
                 for p in products:
-                    if p["enabled"] and p["available"]:groups.setdefault(p["fp_category"],set()).add(p["fp_subcategory"])
+                    if p["enabled"] and p["available"] and self.e.rule("auto_raise",p) and (p["supplier"]!="fazer" or self.e.direction_open(p["service"])):groups.setdefault(p["fp_category"],set()).add(p["fp_subcategory"])
                 for category,subcats in groups.items():
                     key="raise_next:"+str(category)
                     if time.time()<self.db.setting(key,0):continue
                     wait=fp.raise_lots(category,sorted(subcats))
-                    self.db.set(key,time.time()+max(wait,self.db.setting("raise_seconds")))
+                    interval=max(self.e.rule("raise_seconds",p) for p in products if p["fp_category"]==category and p["fp_subcategory"] in subcats)
+                    self.db.set(key,time.time()+max(wait,interval))
                     self.db.runtime("raise",{"ok":True,"category":category,"subcategories":sorted(subcats)})
         self.e.resolve_alert("worker:lots")
 
