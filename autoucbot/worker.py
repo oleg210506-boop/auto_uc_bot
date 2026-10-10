@@ -11,6 +11,7 @@ from .db import dumps
 from .utils import BusinessError,cents
 from .adapters.gamecore import ProviderError
 from .adapters.funpay import FunPayError
+from .funpay_guard import FunPayDeferredError, FunPayRateLimitedError
 
 class InstanceLock:
     """Lifetime lock on the persistent volume: one active process per database."""
@@ -33,6 +34,10 @@ class Worker:
         self.due={};self.startup=True;self.fp_baselined=set()
         self.tg=requests.Session()
         self.chat_cursor=0;self.sales_epoch=-1;self.sales_scan_at=0
+        # Retain all customer-configured features, but fix the dangerous old 4–6s interval.
+        if int(self.db.setting("funpay_poll_seconds", 30)) < 20:
+            self.db.set("funpay_poll_seconds", 30)
+            self.db.audit("system", "funpay.poll.migrated", detail="Интервал увеличен до 30 с, чтобы снизить риск HTTP 429")
 
     def start(self):
         self.lock.acquire()
@@ -55,6 +60,16 @@ class Worker:
         if time.time()<self.due.get(key,0):return
         self.due[key]=time.time()+interval
         try:fn()
+        except FunPayDeferredError as exc:
+            self.due[key] = time.time() + max(1, exc.wait_seconds)
+            if isinstance(exc, FunPayRateLimitedError):
+                self.e.alert("funpay", "FunPay: временное ограничение HTTP 429",
+                             "FunPay просит прекратить запросы. Бот автоматически ждёт; не обновляйте ключ и не нажимайте проверку многократно.",
+                             key="worker:funpay")
+            if key == "funpay":
+                self.db.runtime("funpay", {"ok": False, "status": "cooldown" if exc.reason != "local_budget" else "pacing",
+                                                  "retry_after_seconds": exc.wait_seconds})
+            return
         except Exception as exc:
             # Never log request headers, tokens, response bodies or buyer data to Railway logs.
             detail=str(exc) if isinstance(exc,(BusinessError,ProviderError,FunPayError)) else "Внутренняя ошибка: "+type(exc).__name__
@@ -75,7 +90,7 @@ class Worker:
         self.db.runtime("worker",{"ok":True,"pid":os.getpid()})
         if self.db.setting("migration_frozen",False):return
         self.schedule("tasks",1,self.tasks)
-        self.schedule("funpay",self.db.setting("funpay_poll_seconds"),self.funpay)
+        self.schedule("funpay",max(20,int(self.db.setting("funpay_poll_seconds"))),self.funpay)
         self.schedule("purchases",2,self.purchases)
         self.schedule("poll",5,self.poll)
         self.schedule("outbox",2,self.outbox)
@@ -106,7 +121,7 @@ class Worker:
         return self.db.execute("INSERT INTO tasks(kind,payload,created,updated) VALUES(?,?,?,?)",(kind,dumps(payload or {}),now,now))
 
     def tasks(self):
-        task=self.db.one("SELECT * FROM tasks WHERE state='pending' ORDER BY id LIMIT 1")
+        task=self.db.one("SELECT * FROM tasks WHERE state='pending' AND updated<=? ORDER BY id LIMIT 1",(time.time(),))
         if not task:return
         self.db.execute("UPDATE tasks SET state='running',updated=? WHERE id=?",(time.time(),task["id"]))
         try:
@@ -139,6 +154,7 @@ class Worker:
                         else:self.e.poll_batch(b["id"])
                     result="Проверка выполнена. Посмотрите состояние и тревоги заказа."
                 elif kind=="adopt":self.e.adopt(p["id"],p["actor"]);result="Заказ принят под контроль"
+                elif kind=="manual_uid":result=self.e.manually_confirm_recipient_from_chat(p["id"],p["uid"],p["actor"])
                 elif kind=="backup":result=self.db.backup(self.db.setting("backup_keep")).name
                 elif kind=="telegram_test":
                     self.telegram_send(p["chat_id"],"autoUCbot: тест срочных уведомлений. Покупок не выполнялось.");result="Сообщение отправлено"
@@ -152,6 +168,13 @@ class Worker:
                     else:self.e.set_balance(bal/100,"GameCore API","live");result=f"Подтверждён остаток API: {bal/100:.2f} RUB"
                 else:raise BusinessError("Неизвестное действие")
             self.db.execute("UPDATE tasks SET state='done',result=?,updated=? WHERE id=?",(str(result)[:12000],time.time(),task["id"]))
+        except FunPayDeferredError as exc:
+            # No HTTP request was performed; defer, do not mark the task failed.
+            self.db.execute("UPDATE tasks SET state='pending',result=?,updated=? WHERE id=?",
+                            ("Ожидаем FunPay, не повторять вручную",time.time()+max(20, exc.wait_seconds),task["id"]))
+            if isinstance(exc, FunPayRateLimitedError):
+                self.e.alert("funpay", "FunPay: временное ограничение HTTP 429",
+                             "Проверка отложена; сайт попросил подождать.", key="worker:funpay")
         except Exception as exc:
             msg=str(exc) if isinstance(exc,(BusinessError,ProviderError,FunPayError,ValueError)) else type(exc).__name__+": действие не выполнено"
             self.db.execute("UPDATE tasks SET state='error',result=?,updated=? WHERE id=?",(msg[:2000],time.time(),task["id"]))
@@ -160,16 +183,26 @@ class Worker:
         mode=self.e.dataset()
         if mode=="demo":return
         if not self.e.vault.get("funpay_key"):return
+        if self.e.funpay_traffic.is_blocked():
+            self.db.runtime("funpay", {"ok":False,"status":"cooldown",
+                                           "until":self.e.funpay_traffic.until()})
+            return
         with self.e.lock:
             if self.db.setting("migration_frozen",False):return
             fp=self.e.fp("live");fp.ensure()
             products=self.db.rows("SELECT * FROM products WHERE mode='live' AND archived=0 AND verified=1")
-            # Chat polling remains frequent; heavy sales HTML is read when counters
-            # change, or at least every 30 s in case counts happen to cancel each other out.
+            # Poll new orders on changed counters or at most once per 120 s. Live
+            # chat is checked separately, so no need to hammer paid-sales HTML.
             epoch=getattr(fp,"counter_epoch",0)
-            if epoch!=self.sales_epoch or time.time()-self.sales_scan_at>=30 or not self.fp_baselined:
+            if epoch!=self.sales_epoch or time.time()-self.sales_scan_at>=120 or not self.fp_baselined:
                 for subcat in sorted({p["fp_subcategory"] for p in products}):
                     ids=fp.paid_ids(subcat)
+                    if getattr(fp, 'sales_page_limit_hit', False):
+                        self.db.runtime('funpay_sales', {
+                            'ok': True, 'subcategory': subcat,
+                            'history_truncated': True,
+                            'detail': 'Проверены только 3 последние страницы продаж: старую историю сверяйте вручную',
+                        })
                     initial=subcat not in self.fp_baselined
                     for oid in ids:
                         existing=self.db.one("SELECT state FROM orders WHERE id=?",(oid,))
@@ -178,21 +211,26 @@ class Worker:
                         self.e.import_order(d,"live",baseline=initial)
                     self.fp_baselined.add(subcat)
                 self.sales_epoch=epoch;self.sales_scan_at=time.time()
-            # Rotation bounds work per pass but never forgets old unresolved orders.
-            due=self.db.rows("SELECT id FROM orders WHERE mode='live' AND (state NOT IN('completed','cancelled') OR created>?) ORDER BY updated LIMIT 10",(time.time()-7*86400,))
+            # 1–2 status checks per pass; never 10 order requests every six seconds.
+            # Recent closed orders are eventually rechecked for refunds.
+            check_before=time.time()-120
+            due=self.db.rows("""SELECT id FROM orders WHERE mode='live' AND updated<? AND
+                (state NOT IN('completed','cancelled') OR updated<?)
+                ORDER BY updated LIMIT 2""",(check_before,time.time()-1800))
             for o in due:
                 self.e.refresh_status(fp.order(o["id"]))
                 self.db.execute("UPDATE orders SET updated=? WHERE id=?",(time.time(),o["id"]))
             chats=self.db.rows("""SELECT c.* FROM chat_controls c WHERE EXISTS(SELECT 1 FROM orders o WHERE o.chat_id=c.chat_id AND o.mode='live'
                 AND (o.state NOT IN('completed','cancelled') OR o.created>?)) ORDER BY c.chat_id""",(time.time()-86400,))
-            subset=chats[self.chat_cursor:self.chat_cursor+10]
-            self.chat_cursor=(self.chat_cursor+10) if self.chat_cursor+10<len(chats) else 0
+            subset=chats[self.chat_cursor:self.chat_cursor+4]
+            self.chat_cursor=(self.chat_cursor+4) if self.chat_cursor+4<len(chats) else 0
             messages=fp.messages({c["chat_id"]:c["last_seen"] or -1 for c in subset})
             for m in messages:self.e.input_message(m)
         self.db.runtime("funpay",{"ok":True,"user_id":fp.user_id})
         self.e.resolve_alert("worker:funpay")
 
     def purchases(self):
+        if self.e.funpay_traffic.is_blocked():return
         if not self.e.purchase_allowed(self.e.dataset()):return
         # Filter by direction before selecting the queue head; a paused Stars
         # purchase cannot starve unrelated UC orders (and vice versa).
@@ -222,8 +260,8 @@ class Worker:
             self.enqueue("balance_api")
 
     def outbox(self):
-        # Observe never sends to FunPay. Demo messages are persisted but have no external side effects.
-        if self.e.mode()=="observe":return
+        # Observe never sends to FunPay. Cooldown must not turn pending into unknown.
+        if self.e.mode()=="observe" or self.e.funpay_traffic.is_blocked():return
         rows=self.db.rows("SELECT * FROM outbox WHERE mode=? AND state='pending' AND next_attempt<=? ORDER BY id LIMIT 5",(self.e.dataset(),time.time()))
         for m in rows:
             manual=self.db.one("SELECT manual FROM chat_controls WHERE chat_id=?",(m["chat_id"],))
@@ -237,16 +275,40 @@ class Worker:
                 with self.db.tx() as c:
                     c.execute("UPDATE outbox SET state='sent' WHERE id=?",(m["id"],))
                     c.execute("INSERT INTO messages(chat_id,order_id,author,text,direction,created) VALUES(?,?,?,?,?,?)",(m["chat_id"],m["order_id"],"autoUCbot" if m["kind"]=="auto" else "operator",m["text"],"out",time.time()))
+                    if m["kind"]=="auto" and (":request_uid:" in m["dedupe"] or ":confirm_uid:" in m["dedupe"]):
+                        c.execute("UPDATE orders SET last_reminder=? WHERE id=?", (time.time(), m["order_id"]))
+            except FunPayDeferredError as exc:
+                if isinstance(exc, FunPayRateLimitedError):
+                    # Even a rejected POST is treated conservatively as uncertain.
+                    self.db.execute("UPDATE outbox SET state='uncertain',last_error=? WHERE id=?",
+                                    ("429: необходимо проверить, было ли доставлено сообщение",m["id"]))
+                    self.e.alert("funpay", "FunPay: временное ограничение HTTP 429",
+                                 "Ожидаем восстановления; проверьте последнее сообщение вручную.", key="worker:funpay")
+                else:
+                    # The traffic gate rejected the call before any HTTP request.
+                    self.db.execute("UPDATE outbox SET state='pending',next_attempt=? WHERE id=?",
+                                    (time.time()+exc.wait_seconds,m["id"]))
+                    return
             except Exception:
                 self.db.execute("UPDATE outbox SET state='uncertain',last_error='Доставка сообщения не подтверждена; автоматического повтора нет' WHERE id=?",(m["id"],))
                 self.e.alert("manual","Проверьте сообщение в чате FunPay","Сообщение могло отправиться. Проверьте чат перед ручным повтором.",m["order_id"],key="outbox:"+str(m["id"]))
 
     def reminders(self):
-        if self.e.mode()=="observe":return
+        if self.e.mode()=="observe" or self.e.funpay_traffic.is_blocked():return
         now=time.time()
         for o in self.db.rows("SELECT * FROM orders WHERE mode=? AND state IN('awaiting_uid','awaiting_confirmation')",(self.e.dataset(),)):
             if now-o["created"]>self.e.rule("uid_timeout_seconds",o):
                 self.e.alert("manual","Покупатель долго не присылает получателя/подтверждение","Автоматический возврат не выполняется",o["id"],key="uid:"+o["id"])
+            # A delayed/imported live order must not get several reminders before
+            # its *first* UID request was actually sent to the customer.
+            if o["mode"]=="live" and not o["last_reminder"]:
+                sent=self.db.one("SELECT 1 FROM outbox WHERE order_id=? AND state='sent' AND "
+                                 "(dedupe LIKE ? OR dedupe LIKE ?)",
+                                 (o["id"],o["id"]+":request_uid:%",o["id"]+":confirm_uid:%"))
+                if not sent:
+                    continue
+                self.db.execute("UPDATE orders SET last_reminder=? WHERE id=?",(now,o["id"]))
+                continue
             if self.e.rule("reminders",o) and o["reminder_count"]<self.e.rule("reminder_limit",o) and now-max(o["last_reminder"],o["created"])>self.e.rule("reminder_seconds",o):
                 self.e.queue(o["id"],"reminder",str(o["reminder_count"]))
                 self.db.execute("UPDATE orders SET reminder_count=reminder_count+1,last_reminder=? WHERE id=?",(now,o["id"]))
@@ -284,7 +346,9 @@ class Worker:
                 if configured:targets=[x.strip() for x in configured.split(',') if x.strip()]
             for recipient in targets:
                 last=self.db.one("SELECT sent FROM alert_deliveries WHERE alert_id=? AND chat_id=?",(a["id"],recipient))
-                if last and now-last["sent"]<self.db.setting("alert_repeat_seconds"):continue
+                # A single rate-limit incident generates ONE message per person.
+                # Other critical alerts keep their configured repeat interval.
+                if last and (a["kind"]=="funpay" or now-last["sent"]<self.db.setting("alert_repeat_seconds")):continue
                 link=(self.e.config.public_url+"/orders/"+a["order_id"]) if a["order_id"] and self.e.config.public_url else self.e.config.public_url
                 self.telegram_send(recipient,"⚠️ autoUCbot\n"+a["title"]+"\n"+a["detail"]+"\n"+link)
                 self.db.execute("INSERT INTO alert_deliveries VALUES(?,?,?) ON CONFLICT(alert_id,chat_id) DO UPDATE SET sent=excluded.sent",(a["id"],recipient,now))
@@ -292,6 +356,7 @@ class Worker:
 
     def lots(self):
         if self.e.mode()!="live" or not self.db.setting("live_armed") or not self.e.config.enable_live:return
+        if self.e.funpay_traffic.is_blocked():return
         products=self.db.rows("SELECT * FROM products WHERE mode='live' AND verified=1 AND archived=0")
         with self.e.lock:
             if self.db.setting("migration_frozen",False):return

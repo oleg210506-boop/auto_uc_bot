@@ -18,6 +18,7 @@ class Config:
     # Railway sends requests through its edge proxy. Outside Railway, only
     # loopback peers are trusted by default; operators may set explicit CIDRs.
     forwarded_allow_ips: str = "127.0.0.1,::1"
+    funpay_proxy_url: str = ""
 
     def __post_init__(self):
         if self.public_url:
@@ -51,7 +52,8 @@ class Config:
                    os.getenv("ENABLE_LIVE_PURCHASES") == "true",
                    os.getenv("COOKIE_SECURE", "true") == "true",
                    os.getenv("START_WORKER", "true") == "true",
-                   forwarded_allow_ips=forwarded)
+                   forwarded_allow_ips=forwarded,
+                   funpay_proxy_url=os.getenv("FUNPAY_PROXY_URL", "").strip())
 
 # kind, default, label, hint, min, max. All financial values here are RUB, not cents.
 FIELDS = {
@@ -66,7 +68,7 @@ FIELDS = {
     "reminder_limit": ("int", 2, "Максимум напоминаний", "", 0, 10),
     "uid_timeout_seconds": ("int", 3600, "Ожидание UID до тревоги, секунд", "Не означает автоматический возврат.", 300, 604800),
     "processing_timeout_seconds": ("int", 600, "Зависший заказ: тревога через, секунд", "Не повторная покупка.", 60, 86400),
-    "funpay_poll_seconds": ("int", 6, "Опрос FunPay, секунд", "Слишком частые запросы не нужны.", 4, 60),
+    "funpay_poll_seconds": ("int", 30, "Опрос FunPay, секунд", "Минимум 20 с. Более частые настройки прежней версии автоматически исправляются.", 20, 180),
     "provider_poll_seconds": ("int", 30, "Проверка выдачи, секунд", "Вебхуки дополняют, но не заменяют проверку.", 10, 600),
     "catalog_seconds": ("int", 900, "Обновление каталога, секунд", "Перед покупкой цена читается заново.", 300, 86400),
     "raise_seconds": ("int", 3600, "Минимальная пауза поднятия, секунд", "Если FunPay требует больше, бот ждёт дольше.", 600, 86400),

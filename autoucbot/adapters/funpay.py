@@ -8,6 +8,7 @@ import re
 import time
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
+from ..funpay_guard import FunPayDeferredError, FunPayRateLimitedError
 import requests
 from bs4 import BeautifulSoup
 from ..utils import BusinessError, cents, positive_int
@@ -16,23 +17,41 @@ class FunPayError(Exception): pass
 
 class FunPay:
     BASE = "https://funpay.com"
-    def __init__(self, key, user_agent, session=None):
+    def __init__(self, key, user_agent, session=None, *, proxy_url="", traffic=None):
         self.session = session or requests.Session()
+        # Railway outbound traffic does not use the proxy configured in a laptop browser.
+        # A proxy is optional, explicit and restricted to FunPay; never used by FazerCards.
+        self.session.trust_env = False
+        if proxy_url:
+            address = urlsplit(proxy_url)
+            if (address.scheme not in ("http", "https") or not address.hostname
+                    or not address.port or address.path not in ("", "/")
+                    or address.query or address.fragment or any(c.isspace() for c in proxy_url)):
+                raise ValueError("FUNPAY_PROXY_URL: используйте http://логин:пароль@IP:PORT")
+            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
+        self.traffic = traffic
         self.session.headers.update({"User-Agent": user_agent or "Mozilla/5.0 autoUCbot/1.0", "Accept-Language": "ru"})
         self.session.cookies.set("golden_key", key, domain="funpay.com", path="/")
         self.session.cookies.set("cookie_prefs", "1", domain="funpay.com", path="/")
         self.user_id, self.csrf, self.connected_at = 0, "", 0
         self.tags = {}; self.counter_epoch = 0
+        self.sales_page_limit_hit = False
 
     def request(self, method, path, **kwargs):
         if not path.startswith("/") or path.startswith("//") or "\\" in path or ".." in path:
             raise BusinessError("Некорректный путь FunPay")
+        if self.traffic:
+            self.traffic.before()
         try:
             r = self.session.request(method, self.BASE+path, timeout=(8,25), allow_redirects=False, **kwargs)
         except requests.RequestException:
             raise FunPayError("FunPay не ответил; результат исходящего сообщения/изменения может быть неизвестен") from None
+        if r.status_code == 429 and self.traffic:
+            self.traffic.limited(r.headers, path)
         if r.status_code != 200:
-            raise FunPayError(f"FunPay HTTP {r.status_code}. Проверьте вход/ограничения в браузере. CAPTCHA не обходится.")
+            raise FunPayError(f"FunPay HTTP {r.status_code}. Проверьте состояние аккаунта и ограничения на сайте. CAPTCHA не обходится.")
+        if self.traffic:
+            self.traffic.ok()
         if len(r.content) > 6_000_000: raise FunPayError("Неожиданно большой ответ FunPay")
         return r
 
@@ -54,7 +73,11 @@ class FunPay:
     def paid_ids(self, subcategory):
         self.ensure()
         ids, cont = [], None
-        for _ in range(100):
+        self.sales_page_limit_hit = False
+        # Inspect only the latest pages; rereading the entire paid-sales archive
+        # on every sweep can generate dozens of requests and provoke HTTP 429.
+        # Older historical orders are intentionally manual, not auto-delivered.
+        for page_index in range(3):
             params = {"state": "paid", "section": f"lot-{int(subcategory)}"}
             if cont:
                 r = self.request("POST", "/orders/trade", params=params, data={**params, "continue": cont})
@@ -73,8 +96,11 @@ class FunPay:
             value = nxt.get("value") if nxt else None
             if not value: return list(dict.fromkeys(ids))
             if value == cont: raise FunPayError("Повтор страницы FunPay: безопасная остановка чтения")
+            if page_index == 2:
+                self.sales_page_limit_hit = True
+                return list(dict.fromkeys(ids))
             cont = value
-        raise FunPayError("Слишком много страниц оплаченных заказов: требуется сверка")
+        return list(dict.fromkeys(ids))
 
     def order(self, oid):
         self.ensure()
@@ -137,16 +163,25 @@ class FunPay:
             dat = obj.get("data",{})
             if not isinstance(dat,dict):continue
             node = dat.get("node") or {}
-            chat = node.get("name") or str(obj.get("id"))
+            chat = (node.get("name") if isinstance(node, dict) else node if isinstance(node, str) else None) or str(obj.get("id"))
             if chat not in chats: continue
             self.tags[chat] = obj.get("tag","00000000")
             for m in dat.get("messages") or []:
-                soup=BeautifulSoup(m.get("html", ""),"html.parser")
-                text_node=soup.select_one(".chat-msg-text")
+                if not isinstance(m, dict) or not str(m.get("id", "")).isdigit():
+                    continue
+                soup = BeautifulSoup(m.get("html", "") if isinstance(m.get("html", ""), str) else "", "html.parser")
+                text_node = soup.select_one(".chat-msg-text")
                 if text_node:
-                    for br in text_node.find_all("br"): br.replace_with("\n")
-                text=text_node.get_text().strip() if text_node else ""
-                msgs.append({"id":str(m["id"]),"chat_id":chat,"author":int(m.get("author",0)),"text":text})
+                    for br in text_node.find_all("br"):
+                        br.replace_with("\n")
+                text = text_node.get_text().strip() if text_node else m.get("text", "")
+                if not isinstance(text, str):
+                    text = ""
+                try:
+                    author = int(m.get("author", 0))
+                except (TypeError, ValueError):
+                    continue
+                msgs.append({"id": str(m["id"]), "chat_id": chat, "author": author, "text": text.strip()})
         return msgs,d
 
     def messages(self, chats): return self.runner(chats)[0]

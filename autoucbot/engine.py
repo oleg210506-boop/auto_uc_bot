@@ -12,6 +12,7 @@ from .db import dumps
 from .utils import BusinessError,cents,positive_int,validate_uid,render_template,day_start
 from .adapters.gamecore import GameCore,ProviderError
 from .adapters.funpay import FunPay,FunPayError
+from .funpay_guard import FunPayTraffic
 from .adapters.demo import DemoGameCore,DemoFunPay
 
 FINAL={"completed","failed","partial","cancelled","manual","observed"}
@@ -28,6 +29,7 @@ class LegacyEngine:
         self.db,self.vault,self.config=db,vault,config
         self.lock=threading.RLock()
         self._provider=None;self._fp=None;self._provider_key=None;self._fp_keys=None
+        self.funpay_traffic = FunPayTraffic(db)
         self.demo_provider=DemoGameCore(db);self.demo_fp=DemoFunPay(db)
         for key,spec in FIELDS.items():
             if db.setting(key) is None: db.set(key,spec[1])
@@ -45,15 +47,19 @@ class LegacyEngine:
         return self._provider
     def fp(self,mode=None):
         if (mode or self.dataset())=="demo": return self.demo_fp
-        keys=(self.vault.get("funpay_key"),self.vault.get("funpay_user_agent"))
+        keys=(self.vault.get("funpay_key"),self.vault.get("funpay_user_agent"),self.config.funpay_proxy_url)
         if self._fp_keys != keys or self._fp is None:
             if self._fp:self._fp.close()
-            self._fp=FunPay(*keys);self._fp_keys=keys
+            self._fp=FunPay(keys[0],keys[1],proxy_url=keys[2],traffic=self.funpay_traffic);self._fp_keys=keys
         return self._fp
 
     def alert(self,kind,title,detail="",order_id=None,key=None):
         key=key or kind+":"+(order_id or "system")
         now=time.time()
+        former=self.db.one("SELECT id,active FROM alerts WHERE key=?",(key,))
+        # A recovered connection that fails again is a NEW incident; alert once again.
+        if former and not former['active'] and kind=='funpay':
+            self.db.execute("DELETE FROM alert_deliveries WHERE alert_id=?",(former['id'],))
         self.db.execute("""INSERT INTO alerts(key,kind,title,detail,order_id,created,updated) VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(key) DO UPDATE SET title=excluded.title,detail=excluded.detail,active=1,
             acked=CASE WHEN alerts.active=0 THEN 0 ELSE alerts.acked END,updated=excluded.updated""",
@@ -512,6 +518,39 @@ class LegacyEngine:
         self.db.execute("UPDATE orders SET state='awaiting_uid',uid=NULL,confirmed=0,hold_reason='',updated=? WHERE id=?",(time.time(),oid))
         self.queue(oid,"request_uid","adopt:"+uuid.uuid4().hex)
         self.db.audit(actor,"order.adopted_not_previously_delivered",oid)
+
+    @locked
+    def manually_confirm_recipient_from_chat(self, oid, recipient, actor):
+        """Owner recovery for a UID sent before order discovery.
+
+        Does not buy anything. The seller first checks the message in FunPay;
+        we verify payment again, forbid prior supplier intents, and (when enabled)
+        ask the buyer to confirm the recipient in a fresh message.
+        """
+        o = self.db.one("SELECT * FROM orders WHERE id=?", (oid,))
+        if not o or o['state'] != 'awaiting_uid':
+            raise BusinessError('UID можно восстановить только для заказа, ожидающего получателя. Проблемный заказ сначала сверьте вручную.')
+        if self.db.one('SELECT id FROM batches WHERE order_id=?', (oid,)):
+            raise BusinessError('По заказу уже была попытка закупки. Повторная выдача запрещена.')
+        if o['delivered'] or o['confirmed']:
+            raise BusinessError('Товар уже выдавался или получатель подтверждён')
+        if o['mode'] != 'live' or self.mode() != 'live':
+            raise BusinessError('Ручная сверка UID предназначена для live-заказов')
+        payment = self.fp('live').order(oid)
+        self.refresh_status(payment, o)
+        if payment['status'] != 'paid':
+            raise BusinessError('FunPay не подтвердил оплату')
+        recipient = self.validate_recipient(str(recipient).strip(), o, verify=True)
+        code = secrets.token_hex(3).upper()
+        confirm = bool(self.rule('confirm_uid', o))
+        self.db.execute('UPDATE orders SET uid=?,confirm_code=?,confirmed=?,state=?,updated=? WHERE id=?',
+                        (recipient, code, int(not confirm), 'awaiting_confirmation' if confirm else 'ready', time.time(), oid))
+        if confirm:
+            self.queue(oid, 'confirm_uid', 'manual:'+code)
+        self.db.audit(actor, 'order.uid_recovered_reviewed_chat', oid,
+                      'Получатель внесён владельцем после сверки переписки и оплаты')
+        return ('ID сохранён. Ожидается подтверждение покупателя.' if confirm else
+                'ID сохранён. После проверки оплаты бот сможет начать выдачу.')
 
     @locked
     def seed_demo(self,quantity=3,uc=60):

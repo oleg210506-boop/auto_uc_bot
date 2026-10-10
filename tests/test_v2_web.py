@@ -30,7 +30,7 @@ def form(response):
 @pytest.mark.parametrize('path',['/services/uc','/services/stars','/migration','/connections','/catalog','/settings','/stats','/customers','/orders'])
 def test_new_pages_render_with_both_directions(client,app,path):
     e=app.state.engine;finish(e,ready_fazer(e,'uc',3,60));finish(e,ready_fazer(e))
-    r=client.get(path);assert r.status_code==200 and '2.0.0-rc1' in r.text
+    r=client.get(path);assert r.status_code==200 and '2.0.1-rc1' in r.text
 
 
 def test_service_settings_do_not_modify_other_service(client,app):

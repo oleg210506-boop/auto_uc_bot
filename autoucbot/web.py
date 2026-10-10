@@ -209,8 +209,10 @@ def create_app(config=None):
         return page(request,"dashboard.html",counts=counts,wallet=engine.wallet_view(),services={k:{"open":engine.direction_open(k),"paused":db.setting("svc_"+k+"_paused",False)} for k in ("uc","stars")},balance=engine.balance(),balance_at=db.setting("balance_verified:"+data),
                     latest=db.rows("SELECT * FROM orders WHERE mode=? ORDER BY created DESC LIMIT 8",(data,)),
                     alerts=db.rows("SELECT * FROM alerts WHERE active=1 ORDER BY updated DESC LIMIT 5"),
-                    runtime=db.rows("SELECT * FROM runtime WHERE key IN('worker','funpay','catalog:live','raise','balance_api','fazer_wallet:live','fazer_wallet:demo') ORDER BY key"),
-                    reasons=engine.live_ready(),pause_reason=db.setting("pause_reason",""),live_armed=db.setting("live_armed"))
+                    runtime=db.rows("SELECT * FROM runtime WHERE key IN('worker','funpay','funpay_guard','funpay_sales','catalog:live','raise','balance_api','fazer_wallet:live','fazer_wallet:demo') ORDER BY key"),
+                    reasons=engine.live_ready(),funpay_proxy_configured=bool(config.funpay_proxy_url),
+                    funpay_cooldown_until=engine.funpay_traffic.until(),
+                    funpay_cooldown_active=engine.funpay_traffic.is_blocked(),pause_reason=db.setting("pause_reason",""),live_armed=db.setting("live_armed"))
     @app.post("/control")
     async def control(request:Request):
         owner(request);f=await request.form();action=f.get("action")
@@ -271,6 +273,17 @@ def create_app(config=None):
                 owner(request)
                 if f.get("ack") not in ("UC НЕ ВЫДАВАЛИСЬ","ТОВАР НЕ ВЫДАВАЛСЯ"):raise BusinessError("Подтвердите ТОВАР НЕ ВЫДАВАЛСЯ после проверки истории")
                 tid=worker.enqueue("adopt",{"id":oid,"actor":actor(request)});notice=task_notice(tid)
+            elif action=="recover_uid":
+                owner(request)
+                if f.get("ack")!="UID СВЕРЕН":
+                    raise BusinessError("Введите UID СВЕРЕН только после личной проверки сообщения покупателя на FunPay")
+                if o['state']!='awaiting_uid' or o['mode']!='live':
+                    raise BusinessError("UID можно восстановить только в ожидающем его live-заказе")
+                uid=str(f.get('uid','')).strip()
+                if not 1<=len(uid)<=80:
+                    raise BusinessError("UID/username должен содержать от 1 до 80 символов")
+                tid=worker.enqueue("manual_uid",{"id":oid,"uid":uid,"actor":actor(request)})
+                notice=task_notice(tid)
             elif action=="take":
                 c=db.one("SELECT * FROM chat_controls WHERE chat_id=?",(o["chat_id"],))
                 if c["owner_user_id"] not in (None,request.state.user["id"]) and request.state.user["role"]!="owner":raise BusinessError("Чат занят другим оператором")
